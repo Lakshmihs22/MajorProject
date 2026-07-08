@@ -1,0 +1,155 @@
+networks:
+  edgeshield-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  edgeshield-data:
+
+services:
+
+  # ---------- shared infrastructure ----------
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.30
+
+  # ---------- Person A: network + sensor + ML ----------
+
+  attacker:
+    build:
+      context: .
+      dockerfile: person-a-sensor-ml/attacker/Dockerfile
+    container_name: attacker
+    depends_on:
+      - edge-node-1
+      - edge-node-2
+      - edge-node-3
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.10
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - edgeshield-data:/data
+
+  edge-node-1:
+    build: ./person-a-sensor-ml/edge-node
+    container_name: edge-node-1
+    hostname: edge-node-1
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.11
+
+  edge-node-2:
+    build: ./person-a-sensor-ml/edge-node
+    container_name: edge-node-2
+    hostname: edge-node-2
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.12
+
+  edge-node-3:
+    build: ./person-a-sensor-ml/edge-node
+    container_name: edge-node-3
+    hostname: edge-node-3
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.13
+
+  sensor-agent:
+    build:
+      context: .
+      dockerfile: person-a-sensor-ml/sensor-agent/Dockerfile
+    container_name: sensor-agent
+    depends_on:
+      - redis
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.20
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - edgeshield-data:/data
+    environment:
+      - REDIS_HOST=redis
+      - SQLITE_PATH=/data/edgeshield.db
+
+  # ---------- Person B: analysis agent ----------
+
+  analysis-agent:
+    build:
+      context: .
+      dockerfile: person-b-analysis/Dockerfile
+    container_name: analysis-agent
+    depends_on:
+      - redis
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.31
+    volumes:
+      - edgeshield-data:/data
+    environment:
+      - REDIS_HOST=redis
+      - SQLITE_PATH=/data/edgeshield.db
+
+  # ---------- Person C: defender agent ----------
+
+  defender-agent:
+    build:
+      context: .
+      dockerfile: person-c-defender/Dockerfile
+    container_name: defender-agent
+    depends_on:
+      - redis
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.32
+    cap_add:
+      - NET_ADMIN
+    privileged: true   # needed for iptables; narrow this once policy engine is finished
+    volumes:
+      - edgeshield-data:/data
+    environment:
+      - REDIS_HOST=redis
+      - SQLITE_PATH=/data/edgeshield.db
+
+  # ---------- Person D: dashboard + report + evaluation ----------
+
+  dashboard-backend:
+    build:
+      context: .
+      dockerfile: person-d-dashboard/backend/Dockerfile
+    container_name: dashboard-backend
+    depends_on:
+      - redis
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.40
+    ports:
+      - "8000:8000"
+    volumes:
+      - edgeshield-data:/data
+    environment:
+      - REDIS_HOST=redis
+      - SQLITE_PATH=/data/edgeshield.db
+
+  dashboard-frontend:
+    build: ./person-d-dashboard/frontend
+    container_name: dashboard-frontend
+    depends_on:
+      - dashboard-backend
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.41
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000

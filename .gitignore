@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+build/
+dist/
+
+# Data / secrets
+data/*.db
+data/*.jsonl
+data/*.sqlite
+.env
+*.log
+
+# ML model artifacts (large binary files -- consider Git LFS if needed)
+*.joblib
+*.pkl
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Keep the data folder itself tracked
+!data/.gitkeep
