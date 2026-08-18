@@ -29,3 +29,27 @@ data/*.sqlite
 
 # Keep the data folder itself tracked
 !data/.gitkeep
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+build/
+
+# Environment
+.env
+.env.local
+
+# SQLite local database
+data/*.db
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

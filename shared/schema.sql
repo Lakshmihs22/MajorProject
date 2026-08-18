@@ -60,3 +60,16 @@ CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
 CREATE INDEX IF NOT EXISTS idx_chains_status ON attack_chains(status);
 CREATE INDEX IF NOT EXISTS idx_scores_chain ON threat_scores(chain_id);
 CREATE INDEX IF NOT EXISTS idx_responses_status ON responses(status);
+-- Node health information used by Person D dashboard
+
+CREATE TABLE IF NOT EXISTS node_health (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_name TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL,
+    cpu_usage REAL,
+    memory_usage REAL,
+    last_updated TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_health_status
+ON node_health(status);
