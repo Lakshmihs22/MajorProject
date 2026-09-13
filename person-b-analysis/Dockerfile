@@ -6,6 +6,7 @@ COPY person-b-analysis/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared/ ./shared/
+COPY fixtures/ ./fixtures/
 COPY person-b-analysis/src/ ./src/
 
-CMD ["python", "src/analysis_agent.py"]
+CMD ["python", "-m", "src.analysis_agent"]
