@@ -10,16 +10,14 @@ volumes:
 
 services:
 
-  # ---------- shared infrastructure ----------
-
   redis:
     image: redis:7-alpine
     container_name: redis
+    ports:
+      - "6379:6379"
     networks:
       edgeshield-net:
         ipv4_address: 172.28.0.30
-
-  # ---------- Person A: network + sensor + ML ----------
 
   attacker:
     build:
@@ -82,8 +80,6 @@ services:
       - REDIS_HOST=redis
       - SQLITE_PATH=/data/edgeshield.db
 
-  # ---------- Person B: analysis agent ----------
-
   analysis-agent:
     build:
       context: .
@@ -100,8 +96,6 @@ services:
       - REDIS_HOST=redis
       - SQLITE_PATH=/data/edgeshield.db
 
-  # ---------- Person C: defender agent ----------
-
   defender-agent:
     build:
       context: .
@@ -114,14 +108,12 @@ services:
         ipv4_address: 172.28.0.32
     cap_add:
       - NET_ADMIN
-    privileged: true   # needed for iptables; narrow this once policy engine is finished
+    privileged: true
     volumes:
       - edgeshield-data:/data
     environment:
       - REDIS_HOST=redis
       - SQLITE_PATH=/data/edgeshield.db
-
-  # ---------- Person D: dashboard + report + evaluation ----------
 
   dashboard-backend:
     build:
