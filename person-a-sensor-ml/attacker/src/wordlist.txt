@@ -1,0 +1,12 @@
+password
+123456
+admin
+root
+letmein
+qwerty
+admin123
+changeme
+welcome1
+iloveyou
+monkey
+football

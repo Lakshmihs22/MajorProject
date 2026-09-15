@@ -21,4 +21,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared/ ./shared/
 COPY person-a-sensor-ml/attacker/src/ ./src/
 
-CMD ["python", "src/attack_agent.py"]
+CMD ["python","-u","src/attack_agent.py"]
