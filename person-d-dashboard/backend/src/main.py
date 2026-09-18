@@ -23,17 +23,29 @@ from fastapi.middleware.cors import CORSMiddleware
 # Database is expected at:
 # MajorProject/data/edgeshield.db
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+configured_database_path = os.getenv("SQLITE_PATH")
 
-DEFAULT_DATABASE_PATH = (
-    PROJECT_ROOT / "data" / "edgeshield.db"
-)
+if configured_database_path:
 
+    DATABASE_PATH = configured_database_path
 
-DATABASE_PATH = os.getenv(
-    "SQLITE_PATH",
-    str(DEFAULT_DATABASE_PATH)
-)
+else:
+
+    source_path = Path(__file__).resolve()
+    parent_paths = source_path.parents
+
+    if len(parent_paths) > 3:
+
+        # Host layout: MajorProject/person-d-dashboard/backend/src/main.py
+        PROJECT_ROOT = parent_paths[3]
+        DATABASE_PATH = str(
+            PROJECT_ROOT / "data" / "edgeshield.db"
+        )
+
+    else:
+
+        # Container layout: /app/src/main.py. The shared volume is /data.
+        DATABASE_PATH = "/data/edgeshield.db"
 
 
 # ============================================================
