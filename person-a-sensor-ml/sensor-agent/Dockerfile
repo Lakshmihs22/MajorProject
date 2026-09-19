@@ -17,4 +17,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared/ ./shared/
 COPY person-a-sensor-ml/sensor-agent/src/ ./src/
 
-CMD ["python", "src/sensor_agent.py"]
+CMD ["python", "-u", "src/sensor_agent.py"]

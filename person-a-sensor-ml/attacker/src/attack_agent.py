@@ -254,9 +254,13 @@ def main():
     targets = list(NODE_IPS.keys())
     open_ports_by_ip = run_port_scan(targets)
 
+    time.sleep(6)  # let the port scan traffic clear the sensor's window
+
     brute_force_target = pick_brute_force_target(open_ports_by_ip)
     if brute_force_target:
         run_brute_force(brute_force_target)
+
+        time.sleep(6)  # let brute force traffic clear before pivoting
 
         lateral_target = pick_lateral_target(open_ports_by_ip, brute_force_target)
         if lateral_target:
@@ -265,6 +269,8 @@ def main():
             print("[attack-agent] no other SSH-open node found, skipping lateral_movement stage")
     else:
         print("[attack-agent] no SSH-open target found, skipping brute_force and lateral_movement stages")
+
+    time.sleep(6)  # let lateral movement traffic clear before the flood
 
     run_ddos(targets)
 

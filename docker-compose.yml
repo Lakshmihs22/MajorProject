@@ -61,16 +61,15 @@ services:
       edgeshield-net:
         ipv4_address: 172.28.0.13
 
-  sensor-agent:
+  sensor-agent-1:
     build:
       context: .
       dockerfile: person-a-sensor-ml/sensor-agent/Dockerfile
-    container_name: sensor-agent
+    container_name: sensor-agent-1
     depends_on:
       - redis
-    networks:
-      edgeshield-net:
-        ipv4_address: 172.28.0.20
+      - edge-node-1
+    network_mode: "service:edge-node-1"
     cap_add:
       - NET_RAW
       - NET_ADMIN
@@ -79,6 +78,45 @@ services:
     environment:
       - REDIS_HOST=redis
       - SQLITE_PATH=/data/edgeshield.db
+      - SENSOR_LABEL=edge-node-1
+
+  sensor-agent-2:
+    build:
+      context: .
+      dockerfile: person-a-sensor-ml/sensor-agent/Dockerfile
+    container_name: sensor-agent-2
+    depends_on:
+      - redis
+      - edge-node-2
+    network_mode: "service:edge-node-2"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - edgeshield-data:/data
+    environment:
+      - REDIS_HOST=redis
+      - SQLITE_PATH=/data/edgeshield.db
+      - SENSOR_LABEL=edge-node-2
+
+  sensor-agent-3:
+    build:
+      context: .
+      dockerfile: person-a-sensor-ml/sensor-agent/Dockerfile
+    container_name: sensor-agent-3
+    depends_on:
+      - redis
+      - edge-node-3
+    network_mode: "service:edge-node-3"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - edgeshield-data:/data
+    environment:
+      - REDIS_HOST=redis
+      - SQLITE_PATH=/data/edgeshield.db
+      - SENSOR_LABEL=edge-node-3
 
   analysis-agent:
     build:
