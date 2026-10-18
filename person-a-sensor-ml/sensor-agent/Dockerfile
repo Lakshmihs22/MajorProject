@@ -7,6 +7,7 @@ RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sourc
     apt-get update && apt-get install -y --no-install-recommends \
     libpcap-dev \
     tcpdump \
+    suricata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -16,5 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared/ ./shared/
 COPY person-a-sensor-ml/sensor-agent/src/ ./src/
+COPY person-a-sensor-ml/sensor-agent/suricata/suricata.yaml /etc/suricata/suricata.yaml
+COPY person-a-sensor-ml/sensor-agent/suricata/local.rules /etc/suricata/rules/local.rules
+COPY person-a-sensor-ml/sensor-agent/start.sh ./start.sh
+RUN chmod +x ./start.sh
 
-CMD ["python", "-u", "src/sensor_agent.py"]
+CMD ["./start.sh"]

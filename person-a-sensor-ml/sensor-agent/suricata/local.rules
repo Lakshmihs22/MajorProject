@@ -1,0 +1,4 @@
+alert tcp any any -> any !22 (msg:"EdgeShield Possible Port Scan"; flags:S; threshold: type threshold, track by_src, count 10, seconds 5; sid:1000001; rev:1;)
+alert tcp any any -> any 22 (msg:"EdgeShield Possible SSH Brute Force"; flags:S; threshold: type threshold, track by_src, count 2, seconds 5; sid:1000002; rev:1;)
+alert tcp any any -> any 22 (msg:"EdgeShield SSH Connection Attempt"; flags:S; threshold: type limit, track by_src, count 1, seconds 5; sid:1000003; rev:1;)
+alert tcp any any -> any any (msg:"EdgeShield Possible DDoS Flood"; flags:S; threshold: type threshold, track by_src, count 100, seconds 5; sid:1000004; rev:1;)
