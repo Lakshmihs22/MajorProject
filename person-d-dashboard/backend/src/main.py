@@ -9,31 +9,7 @@ import redis
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-
-# ============================================================
-# PATH CONFIGURATION
-# ============================================================
-
-# Project root:
-# MajorProject/
-#
-# backend is:
-# MajorProject/person-d-dashboard/backend/
-#
-# Database is expected at:
-# MajorProject/data/edgeshield.db
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
-DEFAULT_DATABASE_PATH = (
-    PROJECT_ROOT / "data" / "edgeshield.db"
-)
-
-
-DATABASE_PATH = os.getenv(
-    "SQLITE_PATH",
-    str(DEFAULT_DATABASE_PATH)
-)
+from .database import DATABASE_PATH, get_connection, initialize_database
 
 
 # ============================================================
@@ -86,18 +62,16 @@ app.add_middleware(
 
 
 # ============================================================
-# DATABASE HELPER
+# DATABASE INITIALIZATION AND CONNECTION
 # ============================================================
 
+@app.on_event("startup")
+def startup_initialize_database():
+    initialize_database()
+
+
 def get_db_connection():
-
-    conn = sqlite3.connect(
-        DATABASE_PATH
-    )
-
-    conn.row_factory = sqlite3.Row
-
-    return conn
+    return get_connection()
 
 
 # ============================================================
@@ -109,7 +83,7 @@ def health():
 
     return {
         "status": "ok",
-        "database": DATABASE_PATH
+        "database": str(DATABASE_PATH)
     }
 
 
@@ -392,165 +366,81 @@ def create_redis_client():
 # ============================================================
 
 @app.websocket("/ws")
-async def websocket_endpoint(
-    websocket: WebSocket
-):
-
+async def websocket_endpoint(websocket: WebSocket):
+    """Keep the browser socket alive and forward Redis events when available."""
     await websocket.accept()
-
-    print(
-        "[WebSocket] Frontend connected"
-    )
-
     redis_client = None
     pubsub = None
-
+    redis_available = False
     try:
+        try:
+            redis_client = create_redis_client()
+            await asyncio.to_thread(redis_client.ping)
+            pubsub = redis_client.pubsub()
+            pubsub.subscribe(
+                "NEW_ALERT", "ML_PREDICTION", "CHAIN_DETECTED",
+                "SCORE_COMPUTED", "RESPONSE_EXECUTED"
+            )
+            redis_available = True
+        except Exception as error:
+            print(f"[WebSocket] Redis unavailable; browser socket remains open: {error}")
 
-        redis_client = create_redis_client()
-
-        redis_client.ping()
-
-        print(
-            "[WebSocket] Redis connected"
-        )
-
-
-        pubsub = redis_client.pubsub()
-
-
-        pubsub.subscribe(
-            "NEW_ALERT",
-            "ML_PREDICTION",
-            "CHAIN_DETECTED",
-            "SCORE_COMPUTED",
-            "RESPONSE_EXECUTED"
-        )
-
-
-        print(
-            "[WebSocket] "
-            "Subscribed to Redis events"
-        )
-
+        await websocket.send_json({
+            "event_type": "CONNECTION_STATUS",
+            "payload": {"websocket": "connected", "redis": "connected" if redis_available else "unavailable"}
+        })
 
         while True:
-
-            # Check Redis for a new event.
-
-            message = await asyncio.to_thread(
-                pubsub.get_message,
-                ignore_subscribe_messages=True,
-                timeout=1.0
-            )
-
-
-            if message:
-
+            if redis_available and pubsub is not None:
                 try:
-
-                    event_type = (
-                        message["channel"]
+                    message = await asyncio.to_thread(
+                        pubsub.get_message,
+                        ignore_subscribe_messages=True,
+                        timeout=1.0
                     )
-
-                    raw_data = (
-                        message["data"]
-                    )
-
-
-                    try:
-
-                        payload = json.loads(
-                            raw_data
-                        )
-
-                    except (
-                        json.JSONDecodeError,
-                        TypeError
-                    ):
-
-                        payload = {
-                            "raw": raw_data
-                        }
-
-
-                    event = {
-
-                        "event_type":
-                            event_type,
-
-                        "payload":
-                            payload
-
-                    }
-
-
-                    await websocket.send_json(
-                        event
-                    )
-
-
-                    print(
-                        "[WebSocket] "
-                        f"Sent event: {event_type}"
-                    )
-
-
+                    if message:
+                        raw_data = message.get("data")
+                        try:
+                            payload = json.loads(raw_data)
+                        except (json.JSONDecodeError, TypeError):
+                            payload = {"raw": raw_data}
+                        await websocket.send_json({
+                            "event_type": message.get("channel", "UNKNOWN"),
+                            "payload": payload
+                        })
+                except WebSocketDisconnect:
+                    raise
                 except Exception as error:
-
-                    print(
-                        "[WebSocket] "
-                        f"Event error: {error}"
-                    )
-
-
-            await asyncio.sleep(0.1)
-
-
+                    print(f"[WebSocket] Redis event error: {error}")
+                    redis_available = False
+                    try:
+                        pubsub.close()
+                    except Exception:
+                        pass
+                    pubsub = None
+                    await websocket.send_json({
+                        "event_type": "CONNECTION_STATUS",
+                        "payload": {"websocket": "connected", "redis": "unavailable"}
+                    })
+            else:
+                # Keep the UI socket connected when running locally without Redis.
+                await asyncio.sleep(2)
+                await websocket.send_json({
+                    "event_type": "CONNECTION_STATUS",
+                    "payload": {"websocket": "connected", "redis": "unavailable"}
+                })
     except WebSocketDisconnect:
-
-        print(
-            "[WebSocket] "
-            "Frontend disconnected"
-        )
-
-
+        print("[WebSocket] Frontend disconnected")
     except Exception as error:
-
-        print(
-            "[WebSocket] Error:",
-            error
-        )
-
-
-        try:
-
-            await websocket.close()
-
-        except Exception:
-
-            pass
-
-
+        print(f"[WebSocket] Error: {error}")
     finally:
-
-        if pubsub:
-
+        if pubsub is not None:
             try:
-
                 pubsub.close()
-
             except Exception:
-
                 pass
-
-
-        if redis_client:
-
+        if redis_client is not None:
             try:
-
                 redis_client.close()
-
             except Exception:
-
                 pass
