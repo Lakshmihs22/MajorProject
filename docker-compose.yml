@@ -134,6 +134,19 @@ services:
       - REDIS_HOST=redis
       - SQLITE_PATH=/data/edgeshield.db
 
+  honeypot:
+    build:
+      context: ./person-c-defender/honeypot
+      dockerfile: Dockerfile
+    container_name: honeypot
+    networks:
+      edgeshield-net:
+        ipv4_address: 172.28.0.200
+    volumes:
+      - edgeshield-data:/data
+    environment:
+      - HONEYPOT_LOG=/data/honeypot_log.jsonl
+
   defender-agent:
     build:
       context: .
@@ -141,6 +154,7 @@ services:
     container_name: defender-agent
     depends_on:
       - redis
+      - honeypot
     networks:
       edgeshield-net:
         ipv4_address: 172.28.0.32
@@ -152,6 +166,7 @@ services:
     environment:
       - REDIS_HOST=redis
       - SQLITE_PATH=/data/edgeshield.db
+      - HONEYPOT_IP=172.28.0.200
 
   dashboard-backend:
     build:

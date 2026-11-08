@@ -15,6 +15,7 @@ COPY person-c-defender/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared/ ./shared/
+COPY person-c-defender/schema_extensions.sql ./schema_extensions.sql
 COPY person-c-defender/src/ ./src/
 
 CMD ["python", "src/defender_agent.py"]
