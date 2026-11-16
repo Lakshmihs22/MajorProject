@@ -12,16 +12,30 @@ shared Redis EventBus when Person A later publishes them.
 """
 
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from shared.eventbus_client import EventBus
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from shared.eventbus_client import EventBus
+except ImportError:
+    module_path = REPO_ROOT / "shared" / "eventbus_client.py"
+    spec = importlib.util.spec_from_file_location("shared.eventbus_client", str(module_path))
+    module = importlib.util.module_from_spec(spec)
+    if spec is not None and spec.loader is not None:
+        spec.loader.exec_module(module)
+    EventBus = module.EventBus
 
 
 logging.basicConfig(
@@ -78,13 +92,22 @@ class AnalysisAgent:
         self.alert_seen_keys = set()
 
     def ensure_schema(self):
+        schema_candidates = [
+            Path(__file__).resolve().parents[2] / "shared" / "schema.sql",
+            Path("shared") / "schema.sql",
+            Path("/app/shared/schema.sql"),
+        ]
+        schema_path = next((p for p in schema_candidates if p.exists()), None)
+        if schema_path is None:
+            logger.warning("Schema file not found; expected one of %s", [str(p) for p in schema_candidates])
+            return
         try:
             conn = sqlite3.connect(self.database_path)
-            with open("shared/schema.sql", "r", encoding="utf-8") as f:
+            with open(schema_path, "r", encoding="utf-8") as f:
                 conn.executescript(f.read())
             conn.commit()
             conn.close()
-            logger.info("Schema ready at %s", self.database_path)
+            logger.info("Schema ready at %s using %s", self.database_path, schema_path)
         except Exception as exc:
             logger.warning("Schema preparation warning: %s", exc)
 
@@ -97,20 +120,41 @@ class AnalysisAgent:
         return datetime.now(timezone.utc).isoformat()
 
     def parse_ts(self, value):
+        """Return a timezone-aware UTC datetime for alert timestamps.
+
+        Existing project fixtures and DB rows may contain ISO strings without an
+        explicit offset (for example datetime.utcnow().isoformat() in fixtures), so
+        we interpret naive timestamps as UTC to stay consistent with the repo's
+        documented timestamp convention.
+        """
+        if value is None:
+            return None
+
         try:
-            if isinstance(value, str):
-                if value.endswith("Z"):
-                    value = value.replace("Z", "+00:00")
-                return datetime.fromisoformat(value)
-            return value
+            if isinstance(value, datetime):
+                dt = value
+            elif isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                dt = datetime.fromisoformat(text)
+            else:
+                return None
         except Exception:
-            return datetime.utcnow()
+            return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def normalize_timestamp(self, value):
         try:
             dt = self.parse_ts(value)
-            # Ensure ISO 8601 UTC string with +00:00
-            return dt.replace(tzinfo=timezone.utc).isoformat()
+            if dt is None:
+                return self.now_iso()
+            return dt.isoformat()
         except Exception:
             return self.now_iso()
 
@@ -145,20 +189,7 @@ class AnalysisAgent:
             conn.close()
 
     def correlate_chains(self):
-        """
-        Person B correlation engine.
-
-        Reads the shared SQLite alerts table, groups by the agreed context tuple
-        (source_ip, target_ip, target_node), and searches a 15-minute sliding window
-        for the prerequisite -> consequence sequence:
-            port_scan -> brute_force -> lateral_movement
-
-        A ddos event may be retained as a final impact stage if it occurs after the
-        laterally moving event in the same correlation window. The function stores
-        the alert IDs as a JSON array in `attack_chains.alert_ids`, stores the MITRE
-        string in `attack_chains.mitre_sequence`, and emits CHAIN_DETECTED only when
-        a new chain record is created or an existing chain record changes meaningfully.
-        """
+        """Build deterministic campaign chains for the same attacker across multi-node alerts."""
         conn = self.connect()
         try:
             rows = conn.execute(
@@ -170,116 +201,90 @@ class AnalysisAgent:
                 """
             ).fetchall()
 
-            # Group alerts by the context every attack chain must share.
             groups = {}
             for row in rows:
-                key = (row["source_ip"], row["target_ip"], row["target_node"])
-                groups.setdefault(key, []).append(dict(row))
+                groups.setdefault(row["source_ip"], []).append(dict(row))
 
             created_or_updated = 0
-            for (source_ip, target_ip, target_node), events in groups.items():
-                events.sort(key=lambda row: self.parse_ts(row["timestamp"]))
+            for source_ip, events in groups.items():
+                normalized_events = []
+                for row in events:
+                    parsed = self.parse_ts(row["timestamp"])
+                    if parsed is None:
+                        logger.warning("Skipping alert %s with invalid timestamp %r", row.get("id"), row.get("timestamp"))
+                        continue
+                    row_copy = dict(row)
+                    row_copy["_dt"] = parsed
+                    normalized_events.append(row_copy)
 
-                # Inspect every event as the window beginning.
-                for start_index, event in enumerate(events):
-                    start_time = self.parse_ts(event["timestamp"])
+                normalized_events.sort(key=lambda row: row["_dt"])
+
+                consumed_ids = set()
+                for start_index, event in enumerate(normalized_events):
+                    if event["id"] in consumed_ids or event["attack_type"] != "port_scan":
+                        continue
+
+                    start_time = event["_dt"]
                     window = []
-                    for later in events[start_index:]:
-                        later_time = self.parse_ts(later["timestamp"])
+                    for later in normalized_events[start_index:]:
+                        later_time = later["_dt"]
                         if later_time - start_time > timedelta(minutes=15):
                             break
-                        # Keep only chronological rows inside the same 15-minute band.
+                        if later["id"] in consumed_ids:
+                            continue
                         window.append(later)
 
                     if len(window) < 3:
                         continue
 
-                    # Walk the window in chronological order and enforce the required strategy.
-                    attack_sequence = [row["attack_type"] for row in window]
-                    # Require exactly the order port_scan -> brute_force -> lateral_movement.
-                    required_seen = []
-                    for attack_type in attack_sequence:
-                        if attack_type in PREREQUISITE:
-                            if attack_type == PREREQUISITE[len(required_seen)]:
-                                required_seen.append(attack_type)
-                                if len(required_seen) == len(PREREQUISITE):
-                                    break
-                    if required_seen != PREREQUISITE:
+                    stage_rows = {}
+                    for row in window:
+                        attack = row["attack_type"]
+                        if attack == "port_scan" and "port_scan" not in stage_rows:
+                            stage_rows["port_scan"] = row
+                        elif attack == "brute_force" and stage_rows.get("port_scan") and "brute_force" not in stage_rows:
+                            stage_rows["brute_force"] = row
+                        elif attack == "lateral_movement" and stage_rows.get("brute_force") and "lateral_movement" not in stage_rows:
+                            stage_rows["lateral_movement"] = row
+                        elif attack == "ddos" and stage_rows.get("lateral_movement") and "ddos" not in stage_rows:
+                            stage_rows["ddos"] = row
+
+                    if not all(name in stage_rows for name in PREREQUISITE):
                         continue
 
-                    # Accept ddos only as an optional impact event that appears
-                    # after the required prerequisite chain has been observed in
-                    # the same source/target/target_node context.
-                    ddos_event = None
-                    lateral_time = None
-                    for row in window:
-                        if row["attack_type"] == "lateral_movement":
-                            lateral_time = self.parse_ts(row["timestamp"])
-                            break
+                    ordered_alert_ids = []
+                    for name in PREREQUISITE:
+                        ordered_alert_ids.append(stage_rows[name]["id"])
+                    if "ddos" in stage_rows:
+                        ordered_alert_ids.append(stage_rows["ddos"]["id"])
 
-                    if lateral_time:
-                        # Restrict the ddos candidate to the same 15-minute window
-                        # slice that already carries the prerequisite events, and
-                        # only consider a ddos event that arrives after the
-                        # lateral_movement stage in that same ordered context.
-                        ddos_candidates = [
-                            row for row in window
-                            if row["attack_type"] == "ddos"
-                            and self.parse_ts(row["timestamp"]) >= lateral_time
-                        ]
-                        if ddos_candidates:
-                            ddos_event = ddos_candidates[0]
-
-                    # Alert ids must be in the chronological chain order.
-                    alert_ids = []
-                    seen_alert_ids = set()
-                    for attack_type in PREREQUISITE:
-                        for row in window:
-                            if row["attack_type"] == attack_type and row["id"] not in seen_alert_ids:
-                                alert_ids.append(row["id"])
-                                seen_alert_ids.add(row["id"])
-                                break
-                    if ddos_event:
-                        if ddos_event["id"] not in seen_alert_ids:
-                            alert_ids.append(ddos_event["id"])
-                            seen_alert_ids.add(ddos_event["id"])
-
-                    # Deterministic chain_id; independent of run order and consistent for same alert set.
-                    seed_ids = sorted(alert_ids)
-                    seed = "|".join(str(v) for v in seed_ids)
-                    chain_id = "chain-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
-
-                    # MITRE sequence string from the same known mapping.
-                    mitre_sequence = " -> ".join([ATTACK_TO_MITRE[a] for a in PREREQUISITE])
-                    if ddos_event:
+                    start_timestamp = self.normalize_timestamp(stage_rows["port_scan"]["timestamp"])
+                    last_updated = self.now_iso()
+                    mitre_sequence = " -> ".join(ATTACK_TO_MITRE[a] for a in PREREQUISITE)
+                    if "ddos" in stage_rows:
                         mitre_sequence += " -> " + ATTACK_TO_MITRE["ddos"]
 
-                    # Use UTC ISO 8601 timestamps everywhere.
-                    start_timestamp = self.normalize_timestamp(window[0]["timestamp"])
-                    last_updated = self.now_iso()
-
-                    # Read existing chain row to decide if update is meaningful.
-                    existing = conn.execute(
-                        "SELECT alert_ids, mitre_sequence, start_time, last_updated FROM attack_chains WHERE chain_id = ?",
-                        (chain_id,),
-                    ).fetchone()
-
-                    new_alert_ids_json = json.dumps(alert_ids)
+                    chain_id = "chain-" + hashlib.sha1(f"{source_ip}|{start_timestamp}|{'|'.join(str(v) for v in ordered_alert_ids)}".encode("utf-8")).hexdigest()[:12]
                     new_payload = {
                         "chain_id": chain_id,
-                        "alert_ids": alert_ids,
+                        "alert_ids": ordered_alert_ids,
                         "mitre_sequence": mitre_sequence,
                         "start_time": start_timestamp,
                         "last_updated": last_updated,
                         "status": "active",
                     }
 
+                    existing = conn.execute(
+                        "SELECT alert_ids, mitre_sequence, start_time, last_updated FROM attack_chains WHERE chain_id = ?",
+                        (chain_id,),
+                    ).fetchone()
+
                     changed = True
                     if existing:
                         old_ids = json.loads(existing["alert_ids"])
                         old_sequence = existing["mitre_sequence"]
                         old_start = existing["start_time"]
-                        if old_ids == alert_ids and old_sequence == mitre_sequence and old_start == start_timestamp:
+                        if old_ids == ordered_alert_ids and old_sequence == mitre_sequence and old_start == start_timestamp:
                             changed = False
 
                     if existing and changed:
@@ -293,9 +298,9 @@ class AnalysisAgent:
                                 status = 'active'
                             WHERE chain_id = ?
                             """,
-                            (new_alert_ids_json, mitre_sequence, start_timestamp, last_updated, chain_id),
+                            (json.dumps(ordered_alert_ids), mitre_sequence, start_timestamp, last_updated, chain_id),
                         )
-                        logger.info("Meaningfully updated chain %s with %s alerts", chain_id, len(alert_ids))
+                        logger.info("Meaningfully updated chain %s with %s alerts", chain_id, len(ordered_alert_ids))
                     elif not existing:
                         conn.execute(
                             """
@@ -303,14 +308,14 @@ class AnalysisAgent:
                             (chain_id, alert_ids, mitre_sequence, start_time, last_updated, status)
                             VALUES (?, ?, ?, ?, ?, 'active')
                             """,
-                            (chain_id, new_alert_ids_json, mitre_sequence, start_timestamp, last_updated),
+                            (chain_id, json.dumps(ordered_alert_ids), mitre_sequence, start_timestamp, last_updated),
                         )
-                        logger.info("Created chain %s with %s alerts", chain_id, len(alert_ids))
+                        logger.info("Created chain %s with %s alerts", chain_id, len(ordered_alert_ids))
                     else:
                         logger.info("Duplicate chain skipped for %s", chain_id)
 
-                    # Publish only when chain is created or changed.
                     if not existing or changed:
+                        conn.commit()
                         try:
                             self.bus.publish(EventBus.CHAIN_DETECTED, new_payload)
                             logger.info("Published %s for %s", EventBus.CHAIN_DETECTED, chain_id)
@@ -318,10 +323,8 @@ class AnalysisAgent:
                             logger.warning("CHAIN_DETECTED publish failed for %s: %s", chain_id, exc)
 
                     created_or_updated += 1 if not existing or changed else 0
-                    # Stop once a single valid window is found for a context; this keeps chains deterministic.
-                    break
+                    consumed_ids.update(ordered_alert_ids)
 
-            conn.commit()
             logger.info("Correlation pass complete; created_or_updated %s chain records", created_or_updated)
         except Exception as exc:
             conn.rollback()
@@ -339,7 +342,7 @@ class AnalysisAgent:
         return "Critical"
 
     def score_chains(self):
-        """Score every active chain deterministically, skipping unchanged score rows."""
+        """Score every active chain deterministically, deduplicating repeated evidence."""
         conn = self.connect()
         try:
             chains = conn.execute(
@@ -370,39 +373,42 @@ class AnalysisAgent:
                 if not rows:
                     continue
 
-                # Compute a deterministic score.
-                score = 0
-                factors = {
-                    "attack_types": [],
-                    "evidence_count": len(rows),
-                    "source_ip": rows[0]["source_ip"] if rows else None,
-                    "target_ip": rows[0]["target_ip"] if rows else None,
-                    "target_node": rows[0]["target_node"] if rows else None,
-                    "mitre_sequence": [ATTACK_TO_MITRE.get(r["attack_type"], "UNKNOWN") for r in rows],
-                    "window_minutes": 15,
-                }
-
+                selected = []
+                seen_attack_types = set()
                 for row in rows:
                     attack_type = row["attack_type"]
-                    factors["attack_types"].append(attack_type)
-                    score += ATTACK_WEIGHTS.get(attack_type, 5)
+                    if attack_type in ("port_scan", "brute_force", "lateral_movement", "ddos") and attack_type not in seen_attack_types:
+                        selected.append(dict(row))
+                        seen_attack_types.add(attack_type)
 
-                # Reward the requested prerequisite-to-consequence chain.
-                if all(x in factors["attack_types"] for x in PREREQUISITE):
+                if not selected:
+                    continue
+
+                score = sum(ATTACK_WEIGHTS.get(row["attack_type"], 5) for row in selected)
+                if set(PREREQUISITE).issubset(set(row["attack_type"] for row in selected)):
                     score += 20
-                if "ddos" in factors["attack_types"]:
+                if "ddos" in {row["attack_type"] for row in selected}:
                     score += 15
-
-                # Add a small size bonus for chain richness.
-                if len(rows) >= 4:
+                if len(selected) >= 4:
                     score += 10
 
-                # Deterministically clamp and map to severity.
                 score = max(0, min(100, score))
                 severity = self.severity_for_score(score)
                 timestamp = self.now_iso()
+                factors = {
+                    "attack_types": [row["attack_type"] for row in selected],
+                    "attack_types_ordered": [row["attack_type"] for row in selected],
+                    "evidence_count": len(selected),
+                    "source_ip": rows[0]["source_ip"] if rows else None,
+                    "target_ips": sorted({row["target_ip"] for row in rows if row["target_ip"]}),
+                    "target_nodes": sorted({row["target_node"] for row in rows if row["target_node"]}),
+                    "mitre_sequence": [ATTACK_TO_MITRE.get(r["attack_type"], "UNKNOWN") for r in selected],
+                    "window_minutes": 15,
+                    "alert_ids": alert_ids,
+                    "chain_start_time": chain["start_time"],
+                    "chain_last_updated": chain["last_updated"],
+                }
 
-                # Avoid duplicate score records for an unchanged chain.
                 latest = conn.execute(
                     """
                     SELECT score, severity_label, factors_json
@@ -427,6 +433,7 @@ class AnalysisAgent:
                     """,
                     (chain["chain_id"], timestamp, score, severity, new_factors),
                 )
+                conn.commit()
 
                 payload = {
                     "chain_id": chain["chain_id"],
@@ -434,16 +441,18 @@ class AnalysisAgent:
                     "severity_label": severity,
                     "timestamp": timestamp,
                 }
-                self.bus.publish(EventBus.SCORE_COMPUTED, payload)
-                logger.info(
-                    "Published %s for %s with score %s (%s)",
-                    EventBus.SCORE_COMPUTED,
-                    chain["chain_id"],
-                    score,
-                    severity,
-                )
+                try:
+                    self.bus.publish(EventBus.SCORE_COMPUTED, payload)
+                    logger.info(
+                        "Published %s for %s with score %s (%s)",
+                        EventBus.SCORE_COMPUTED,
+                        chain["chain_id"],
+                        score,
+                        severity,
+                    )
+                except Exception as exc:
+                    logger.warning("SCORE_COMPUTED publish failed for %s: %s", chain["chain_id"], exc)
 
-            conn.commit()
             logger.info("Scorer pass complete")
         except Exception as exc:
             conn.rollback()
@@ -458,7 +467,6 @@ class AnalysisAgent:
                 logger.warning("Malformed NEW_ALERT payload received: %s", payload)
                 return
 
-            # Accept event payloads from the documented example.
             event_ts = payload.get("timestamp") or self.now_iso()
             event_dtt = self.normalize_timestamp(event_ts)
             source_ip = payload.get("source_ip") or "unknown"
@@ -469,10 +477,9 @@ class AnalysisAgent:
                 logger.warning("Ignoring unsupported attack_type from NEW_ALERT event: %s", attack_type)
                 return
 
-            detection_source = "both"
+            detection_source = payload.get("detection_source") or "both"
             raw_details = json.dumps(payload, sort_keys=True)
 
-            # De-duplicate by event shape and same timestamp.
             seen_key = f"{event_dtt}|{source_ip}|{target_ip}|{target_node}|{attack_type}|{detection_source}".lower()
             if seen_key in self.alert_seen_keys:
                 logger.debug("Duplicate NEW_ALERT ignored: %s", seen_key)
@@ -491,7 +498,6 @@ class AnalysisAgent:
                 ).fetchone()
                 if existing:
                     logger.info("Duplicate alert row already exists for event: %s", seen_key)
-                    conn.close()
                     return
 
                 conn.execute(
@@ -504,6 +510,9 @@ class AnalysisAgent:
                 )
                 conn.commit()
                 logger.info("Inserted alert from NEW_ALERT event: %s", seen_key)
+                self.map_mitre_tactics()
+                self.correlate_chains()
+                self.score_chains()
             except Exception as exc:
                 conn.rollback()
                 logger.exception("NEW_ALERT insertion failed: %s", exc)
@@ -551,17 +560,20 @@ class AnalysisAgent:
     def start_event_listener(self):
         """Subscribe to both NEW_ALERT and ML_PREDICTION while allowing fixture/database mode to remain independent of Person A."""
         def worker():
-            try:
-                pubsub = self.bus.subscribe([EventBus.NEW_ALERT, EventBus.ML_PREDICTION])
-                for channel, payload in self.bus.listen():
-                    if channel == EventBus.NEW_ALERT:
-                        logger.info("Received NEW_ALERT payload: %s", json.dumps(payload, sort_keys=True))
-                        self.insert_alert_from_event(payload)
-                    elif channel == EventBus.ML_PREDICTION:
-                        logger.info("Received ML_PREDICTION payload: %s", json.dumps(payload, sort_keys=True))
-                        self.insert_ml_prediction_from_event(payload)
-            except Exception as exc:
-                logger.warning("Redis listener stopped or Redis unavailable: %s", exc)
+            while True:
+                try:
+                    pubsub = self.bus.subscribe([EventBus.NEW_ALERT, EventBus.ML_PREDICTION])
+                    for channel, payload in self.bus.listen():
+                        if channel == EventBus.NEW_ALERT:
+                            logger.info("Received NEW_ALERT payload: %s", json.dumps(payload, sort_keys=True))
+                            self.insert_alert_from_event(payload)
+                        elif channel == EventBus.ML_PREDICTION:
+                            logger.info("Received ML_PREDICTION payload: %s", json.dumps(payload, sort_keys=True))
+                            self.insert_ml_prediction_from_event(payload)
+                except Exception as exc:
+                    logger.warning("Redis listener stopped or Redis unavailable: %s", exc)
+                logger.info("Redis listener reconnecting in 5 seconds")
+                time.sleep(5)
 
         thread = threading.Thread(target=worker, name="event-listener", daemon=True)
         thread.start()
