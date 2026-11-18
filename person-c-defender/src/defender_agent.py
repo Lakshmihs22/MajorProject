@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 # Path setup for local Windows runs and Docker (/app)
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +41,8 @@ REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "/data/edgeshield.db")
 HONEYPOT_IP = os.environ.get("HONEYPOT_IP", "172.28.0.200")
+ATTACKER_CONTAINER = os.environ.get("ATTACKER_CONTAINER", "attacker")
+DEFENDER_ENFORCEMENT = os.environ.get("DEFENDER_ENFORCEMENT", "simulation").strip().lower()
 
 ROLLBACK_POLL_SEC = 30
 FALLBACK_POLL_SEC = 15
@@ -112,6 +114,11 @@ def get_tier(score: float) -> dict:
 def _conn() -> sqlite3.Connection:
     c = sqlite3.connect(SQLITE_PATH, timeout=10, check_same_thread=False)
     c.row_factory = sqlite3.Row
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=10000")
+    except sqlite3.Error:
+        pass
     return c
 
 
@@ -184,28 +191,30 @@ def _node_cpu_load(victim_ip: str) -> float:
     return 0.0
 
 
-def _policy_score(chain_id: str, raw_score: float) -> float:
-    """Dynamic threshold: device criticality, off-hours, and node load."""
-    _, dst, _ = _get_chain_context(chain_id)
-    if dst == "unknown":
+def _policy_score_for_victim(raw_score: float, victim_ip: str) -> float:
+    if victim_ip == "unknown":
         return raw_score
-
-    delta = CRITICALITY_SCORE_DELTA.get(_device_criticality(dst), 0.0)
+    delta = CRITICALITY_SCORE_DELTA.get(_device_criticality(victim_ip), 0.0)
     hour = datetime.now(timezone.utc).hour
     if hour >= 22 or hour < 6:
         delta += OFF_HOURS_DELTA
-    if _node_cpu_load(dst) >= HIGH_LOAD_CPU_THRESHOLD:
+    if _node_cpu_load(victim_ip) >= HIGH_LOAD_CPU_THRESHOLD:
         delta += HIGH_LOAD_CPU_DELTA
+    return min(100.0, max(0.0, raw_score + delta))
 
-    adjusted = min(100.0, max(0.0, raw_score + delta))
+
+def _policy_score(chain_id: str, raw_score: float) -> float:
+    """Dynamic threshold: worst-case adjustment across all victims on the chain."""
+    _, victims, _ = _get_chain_victims(chain_id)
+    if not victims:
+        return raw_score
+    adjusted = max(_policy_score_for_victim(raw_score, vip) for vip, _ in victims)
     if abs(adjusted - raw_score) >= 0.01:
         log.info(
-            "[policy] chain=%s score %.1f -> %.1f (delta=%+.1f victim=%s)",
+            "[policy] chain=%s score %.1f -> %.1f (multi-victim policy)",
             chain_id,
             raw_score,
             adjusted,
-            delta,
-            dst,
         )
     return adjusted
 
@@ -216,8 +225,33 @@ def _dominant_attack_type(types: list) -> str:
     return max(types, key=lambda t: ATTACK_SEVERITY.get(t, DEFAULT_SEVERITY))
 
 
+def _victim_node_name(victim_ip: str, target_node: Optional[str] = None) -> str:
+    if target_node:
+        return target_node
+    try:
+        conn = _conn()
+        row = conn.execute(
+            "SELECT device_name FROM device_registry WHERE ip_address = ?",
+            (victim_ip,),
+        ).fetchone()
+        conn.close()
+        if row and row["device_name"]:
+            return str(row["device_name"])
+    except Exception:
+        pass
+    return victim_ip
+
+
 def _get_chain_context(chain_id: str) -> Tuple[str, str, str]:
-    """Returns (source_ip attacker, target_ip victim, dominant attack_type)."""
+    """Returns (source_ip attacker, primary target_ip victim, dominant attack_type)."""
+    src, victims, attack_type = _get_chain_victims(chain_id)
+    if not victims:
+        return "unknown", "unknown", attack_type
+    return src, victims[0][0], attack_type
+
+
+def _get_chain_victims(chain_id: str) -> Tuple[str, List[Tuple[str, str]], str]:
+    """Returns (attacker_ip, [(victim_ip, target_node), ...], dominant attack_type)."""
     try:
         conn = _conn()
         chain = conn.execute(
@@ -226,27 +260,35 @@ def _get_chain_context(chain_id: str) -> Tuple[str, str, str]:
         ).fetchone()
         if not chain:
             conn.close()
-            return "unknown", "unknown", "unknown"
+            return "unknown", [], "unknown"
         alert_ids = json.loads(chain["alert_ids"])
         if not alert_ids:
             conn.close()
-            return "unknown", "unknown", "unknown"
+            return "unknown", [], "unknown"
         placeholders = ",".join("?" * len(alert_ids))
         rows = conn.execute(
-            f"""SELECT source_ip, target_ip, attack_type FROM alerts
+            f"""SELECT source_ip, target_ip, target_node, attack_type FROM alerts
                 WHERE id IN ({placeholders})""",
             [int(i) for i in alert_ids],
         ).fetchall()
         conn.close()
         if not rows:
-            return "unknown", "unknown", "unknown"
+            return "unknown", [], "unknown"
         src = rows[0]["source_ip"] or "unknown"
-        dst = rows[0]["target_ip"] or "unknown"
         types = [r["attack_type"] for r in rows if r["attack_type"]]
-        return src, dst, _dominant_attack_type(types)
+        seen: set = set()
+        victims: List[Tuple[str, str]] = []
+        for row in rows:
+            vip = row["target_ip"] or "unknown"
+            if vip == "unknown" or vip in seen:
+                continue
+            seen.add(vip)
+            node = row["target_node"] or _victim_node_name(vip)
+            victims.append((vip, node))
+        return src, victims, _dominant_attack_type(types)
     except Exception as exc:
         log.warning("Could not derive chain context for %s: %s", chain_id, exc)
-        return "unknown", "unknown", "unknown"
+        return "unknown", [], "unknown"
 
 
 def _is_corroborated(chain_id: str) -> bool:
@@ -407,13 +449,43 @@ def _commands_for_tier(
     return None, None
 
 
+def _live_iptables_cmd(cmd: str) -> str:
+    """Apply rules in the lab attacker namespace (OUTPUT toward victims), not defender INPUT."""
+    parts = []
+    for segment in cmd.split(" ; "):
+        segment = segment.strip()
+        if not segment:
+            continue
+        segment = (
+            segment.replace("iptables -A INPUT", "iptables -A OUTPUT")
+            .replace("iptables -I INPUT", "iptables -I OUTPUT")
+            .replace("iptables -D INPUT", "iptables -D OUTPUT")
+            .replace("-s ", "-d ", 1)
+            if " INPUT " in f" {segment} " or segment.startswith("iptables -")
+            and "INPUT" in segment
+            else segment
+        )
+        if "PREROUTING" in segment:
+            segment = segment.replace("PREROUTING", "OUTPUT")
+        if "FORWARD" in segment:
+            segment = segment.replace("FORWARD", "OUTPUT")
+        parts.append(segment)
+    inner = " ; ".join(parts)
+    escaped = inner.replace("'", "'\"'\"'")
+    return f"docker exec {ATTACKER_CONTAINER} sh -c '{escaped}'"
+
+
 def _run_shell(cmd: str) -> bool:
     if not cmd:
         return True
-    log.info("[iptables] RUN: %s", cmd)
+    if DEFENDER_ENFORCEMENT == "simulation":
+        log.info("[iptables] SIMULATED: %s", cmd)
+        return True
+    run_cmd = _live_iptables_cmd(cmd) if DEFENDER_ENFORCEMENT == "live" else cmd
+    log.info("[iptables] RUN (%s): %s", DEFENDER_ENFORCEMENT, run_cmd)
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=15
+            run_cmd, shell=True, capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             log.warning(
@@ -421,12 +493,13 @@ def _run_shell(cmd: str) -> bool:
                 result.returncode,
                 (result.stderr or "").strip(),
             )
+            return DEFENDER_ENFORCEMENT != "live"
         return True
     except subprocess.TimeoutExpired:
-        log.error("[iptables] TIMEOUT: %s", cmd)
+        log.error("[iptables] TIMEOUT: %s", run_cmd)
         return False
     except Exception as exc:
-        log.error("[iptables] ERROR: %s - %s", cmd, exc)
+        log.error("[iptables] ERROR: %s - %s", run_cmd, exc)
         return False
 
 
@@ -476,7 +549,7 @@ def _get_latest_score(chain_id: str):
     return float(row["score"]) if row else None
 
 
-def _update_node_health(target: str, status: str):
+def _update_node_health(node_name: str, status: str):
     try:
         conn = _conn()
         conn.execute(
@@ -485,12 +558,20 @@ def _update_node_health(target: str, status: str):
                ON CONFLICT(node_name) DO UPDATE
                SET status=excluded.status,
                    last_updated=excluded.last_updated""",
-            (target, status, _now()),
+            (node_name, status, _now()),
         )
         conn.commit()
         conn.close()
     except Exception as exc:
         log.warning("[node_health] update failed: %s", exc)
+
+
+def _node_name_from_target(target: str) -> str:
+    if not target or target == "unknown":
+        return target
+    if target.count(".") == 3 and target.replace(".", "").isdigit():
+        return _victim_node_name(target)
+    return target
 
 
 def _log_optional_honeypot(chain_id: str, src: str):
@@ -570,36 +651,48 @@ def _apply_response(chain_id: str, score: float, bus: EventBus):
         log.info("[policy] chain=%s already at tier=%s - skip", chain_id, tier["action_type"])
         return
 
-    src, dst, attack_type = _get_chain_context(chain_id)
-    if src == "unknown" or dst == "unknown":
-        log.warning("[policy] cannot derive src/dst for chain=%s - skip", chain_id)
+    src, victims, attack_type = _get_chain_victims(chain_id)
+    if src == "unknown" or not victims:
+        log.warning("[policy] cannot derive src/victims for chain=%s - skip", chain_id)
         return
 
-    command, rollback_cmd = _commands_for_tier(tier["action_type"], attack_type, src, dst)
-    display_target = dst if tier["action_type"] in ("isolate_node", "full_isolation") else src
+    # One enforcement action per distinct victim IP (Person B multi-victim chains).
+    applied_any = False
+    for dst, node_name in victims:
+        command, rollback_cmd = _commands_for_tier(
+            tier["action_type"], attack_type, src, dst
+        )
+        display_target = dst if tier["action_type"] in ("isolate_node", "full_isolation") else src
 
-    response_id = _write_response(
-        chain_id, tier["action_type"], display_target, rollback_cmd
-    )
-    success = _run_shell(command) if command else True
+        response_id = _write_response(
+            chain_id, tier["action_type"], display_target, rollback_cmd
+        )
+        success = _run_shell(command) if command else True
 
-    if success:
+        if not success:
+            log.error(
+                "[policy] command FAILED chain=%s tier=%s victim=%s",
+                chain_id,
+                tier["action_type"],
+                dst,
+            )
+            continue
+
+        applied_any = True
         log.info(
-            "[policy] APPLIED chain=%s score=%.1f tier=%s attack=%s src=%s dst=%s id=%d",
+            "[policy] APPLIED chain=%s score=%.1f tier=%s attack=%s src=%s dst=%s node=%s id=%d",
             chain_id,
             score,
             tier["action_type"],
             attack_type,
             src,
             dst,
+            node_name,
             response_id,
         )
-        with _state_lock:
-            _active_tier_map[chain_id] = tier["action_type"]
-            _below_since.pop(chain_id, None)
         if tier["action_type"] == "isolate_node":
             _log_optional_honeypot(chain_id, src)
-        _update_node_health(dst, tier["action_type"])
+        _update_node_health(node_name, tier["action_type"])
         bus.publish(
             EventBus.RESPONSE_EXECUTED,
             {
@@ -614,8 +707,11 @@ def _apply_response(chain_id: str, score: float, bus: EventBus):
                 "timestamp": _now(),
             },
         )
-    else:
-        log.error("[policy] command FAILED chain=%s tier=%s", chain_id, tier["action_type"])
+
+    if applied_any:
+        with _state_lock:
+            _active_tier_map[chain_id] = tier["action_type"]
+            _below_since.pop(chain_id, None)
 
 
 def _listener_thread(bus: EventBus):
@@ -690,7 +786,7 @@ def _rollback_thread(bus: EventBus):
                         _log_optional_rollback_history(
                             chain_id, response_id, "score_below_tier"
                         )
-                        _update_node_health(target, "healthy")
+                        _update_node_health(_node_name_from_target(target), "healthy")
                         with _state_lock:
                             _active_tier_map.pop(chain_id, None)
                             _below_since.pop(chain_id, None)
@@ -827,6 +923,8 @@ def main():
     log.info("  REDIS_HOST   = %s:%s", REDIS_HOST, REDIS_PORT)
     log.info("  SQLITE_PATH  = %s", SQLITE_PATH)
     log.info("  HONEYPOT_IP  = %s", HONEYPOT_IP)
+    log.info("  ENFORCEMENT  = %s", DEFENDER_ENFORCEMENT)
+    log.info("  ATTACKER_NS  = %s", ATTACKER_CONTAINER)
     log.info("  WORKERS      = %d", EXECUTOR_WORKERS)
     log.info("=" * 55)
 

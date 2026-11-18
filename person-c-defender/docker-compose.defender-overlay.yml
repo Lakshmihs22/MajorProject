@@ -1,0 +1,11 @@
+# Optional overlay for live iptables in the attacker container namespace.
+# Usage from repo root:
+#   docker compose -f docker-compose.yml -f person-c-defender/docker-compose.defender-overlay.yml up --build defender-agent attacker
+
+services:
+  defender-agent:
+    environment:
+      - DEFENDER_ENFORCEMENT=live
+      - ATTACKER_CONTAINER=attacker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -85,6 +85,8 @@ Open a terminal in the **project root** (folder that contains `docker-compose.ym
 | `SQLITE_PATH` | `/data/edgeshield.db` | Defender (in container) |
 | `HONEYPOT_IP` | `172.28.0.200` | Defender DNAT target |
 | `HONEYPOT_LOG` | `/data/honeypot_log.jsonl` | Honeypot container |
+| `DEFENDER_ENFORCEMENT` | `simulation` | `simulation` (DB + Redis only) or `live` (docker exec into attacker) |
+| `ATTACKER_CONTAINER` | `attacker` | Container name for live iptables (matches root `docker-compose.yml`) |
 
 Host-side demo script: set `REDIS_HOST=localhost` when Redis port `6379` is published.
 
@@ -99,6 +101,13 @@ docker compose up --build redis honeypot defender-agent
 ```
 
 Wait for log line: `Defender Agent is LIVE`.
+
+**If your friend “cannot see the defender at all”:**
+
+1. Confirm the container is running: `docker ps --filter name=defender-agent` (not exited/restarting).
+2. Check logs: `docker logs defender-agent` — a past bug used `Optional` without importing it and the process died immediately on startup; pull the latest `person-c-defender/src/defender_agent.py` if logs show `NameError: Optional`.
+3. The dashboard has no separate “Defender” tile — responses appear under **Response Audit Log** on http://localhost:3000 (needs `defender-agent` + `analysis-agent` or the seed script).
+4. Default enforcement is **simulation** (rows in SQLite + `RESPONSE_EXECUTED` on Redis); live blocking needs the overlay compose file below.
 
 ### 2) Full EdgeShield stack (demo with dashboard)
 
