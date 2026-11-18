@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -77,19 +78,13 @@ class AnalysisAgent:
         # Shared directory path for the container context is copied in the Dockerfile.
         # On the local host, the repository root is used.
         parent = Path(self.database_path).parent
-        try:
-            parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        parent.mkdir(parents=True, exist_ok=True)
 
         # Make sure the SQLite schema is available before we begin.
         self.ensure_schema()
 
         # Shared event bus object.
         self.bus = EventBus(host=self.redis_host, port=self.redis_port)
-
-        # De-duplicate event handling, so NEW_ALERT duplicates do not create duplicate alerts.
-        self.alert_seen_keys = set()
 
     def ensure_schema(self):
         schema_candidates = [
@@ -99,21 +94,25 @@ class AnalysisAgent:
         ]
         schema_path = next((p for p in schema_candidates if p.exists()), None)
         if schema_path is None:
-            logger.warning("Schema file not found; expected one of %s", [str(p) for p in schema_candidates])
-            return
+            raise FileNotFoundError(
+                f"Schema file not found; expected one of {schema_candidates}"
+            )
+        conn = self.connect()
         try:
-            conn = sqlite3.connect(self.database_path)
-            with open(schema_path, "r", encoding="utf-8") as f:
-                conn.executescript(f.read())
-            conn.commit()
-            conn.close()
+            with conn:
+                conn.executescript(schema_path.read_text(encoding="utf-8"))
             logger.info("Schema ready at %s using %s", self.database_path, schema_path)
-        except Exception as exc:
-            logger.warning("Schema preparation warning: %s", exc)
+        except Exception:
+            logger.exception("Schema preparation failed at %s", self.database_path)
+            raise
+        finally:
+            conn.close()
 
     def connect(self):
-        conn = sqlite3.connect(self.database_path)
+        conn = sqlite3.connect(self.database_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 10000")
         return conn
 
     def now_iso(self):
@@ -150,18 +149,16 @@ class AnalysisAgent:
         return dt.astimezone(timezone.utc)
 
     def normalize_timestamp(self, value):
-        try:
-            dt = self.parse_ts(value)
-            if dt is None:
-                return self.now_iso()
-            return dt.isoformat()
-        except Exception:
-            return self.now_iso()
+        dt = self.parse_ts(value)
+        if dt is None:
+            raise ValueError(f"Invalid timestamp: {value!r}")
+        return dt.isoformat()
 
     def map_mitre_tactics(self):
         """Backfill MITRE tactic assignments for any attack_type already known in the repo."""
         conn = self.connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT id, attack_type, mitre_tactic FROM alerts ORDER BY timestamp ASC"
             ).fetchall()
@@ -188,38 +185,65 @@ class AnalysisAgent:
         finally:
             conn.close()
 
+    def _campaign_id(self, row):
+        """Return the optional campaign identifier preserved in an alert's raw payload."""
+        try:
+            details = json.loads(row["raw_details"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(details, dict):
+            return None
+        campaign_id = details.get("campaign_id")
+        if isinstance(campaign_id, (str, int)) and not isinstance(campaign_id, bool):
+            campaign_id = str(campaign_id).strip()
+            return campaign_id or None
+        return None
+
     def correlate_chains(self):
-        """Build deterministic campaign chains for the same attacker across multi-node alerts."""
+        """Build ordered campaign chains across targets and edge nodes."""
         conn = self.connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT id, timestamp, source_ip, target_ip, target_node, attack_type, mitre_tactic
+                SELECT id, timestamp, source_ip, target_ip, target_node, attack_type,
+                       mitre_tactic, raw_details
                 FROM alerts
                 WHERE attack_type IN ('port_scan','brute_force','lateral_movement','ddos')
-                ORDER BY timestamp ASC
                 """
             ).fetchall()
 
             groups = {}
             for row in rows:
-                groups.setdefault(row["source_ip"], []).append(dict(row))
+                details = dict(row)
+                campaign_id = self._campaign_id(details)
+                key = (
+                    ("campaign", campaign_id)
+                    if campaign_id
+                    else ("source_ip", details["source_ip"])
+                )
+                groups.setdefault(key, []).append(details)
 
             created_or_updated = 0
-            for source_ip, events in groups.items():
+            for (identity_type, identity_value), events in groups.items():
+                campaign_id = identity_value if identity_type == "campaign" else None
                 normalized_events = []
                 for row in events:
                     parsed = self.parse_ts(row["timestamp"])
                     if parsed is None:
-                        logger.warning("Skipping alert %s with invalid timestamp %r", row.get("id"), row.get("timestamp"))
+                        logger.warning(
+                            "Skipping alert %s with invalid timestamp %r",
+                            row["id"],
+                            row["timestamp"],
+                        )
                         continue
-                    row_copy = dict(row)
-                    row_copy["_dt"] = parsed
-                    normalized_events.append(row_copy)
+                    row["_dt"] = parsed
+                    normalized_events.append(row)
 
-                normalized_events.sort(key=lambda row: row["_dt"])
-
+                normalized_events.sort(key=lambda row: (row["_dt"], row["id"]))
                 consumed_ids = set()
+
                 for start_index, event in enumerate(normalized_events):
                     if event["id"] in consumed_ids or event["attack_type"] != "port_scan":
                         continue
@@ -227,108 +251,176 @@ class AnalysisAgent:
                     start_time = event["_dt"]
                     window = []
                     for later in normalized_events[start_index:]:
-                        later_time = later["_dt"]
-                        if later_time - start_time > timedelta(minutes=15):
+                        if later["_dt"] - start_time > timedelta(minutes=15):
                             break
-                        if later["id"] in consumed_ids:
-                            continue
-                        window.append(later)
-
-                    if len(window) < 3:
-                        continue
+                        if later["id"] not in consumed_ids:
+                            window.append(later)
 
                     stage_rows = {}
                     for row in window:
                         attack = row["attack_type"]
                         if attack == "port_scan" and "port_scan" not in stage_rows:
                             stage_rows["port_scan"] = row
-                        elif attack == "brute_force" and stage_rows.get("port_scan") and "brute_force" not in stage_rows:
+                        elif (
+                            attack == "brute_force"
+                            and "port_scan" in stage_rows
+                            and "brute_force" not in stage_rows
+                        ):
                             stage_rows["brute_force"] = row
-                        elif attack == "lateral_movement" and stage_rows.get("brute_force") and "lateral_movement" not in stage_rows:
+                        elif (
+                            attack == "lateral_movement"
+                            and "brute_force" in stage_rows
+                            and "lateral_movement" not in stage_rows
+                        ):
                             stage_rows["lateral_movement"] = row
-                        elif attack == "ddos" and stage_rows.get("lateral_movement") and "ddos" not in stage_rows:
+                        elif (
+                            attack == "ddos"
+                            and "lateral_movement" in stage_rows
+                            and "ddos" not in stage_rows
+                        ):
                             stage_rows["ddos"] = row
 
                     if not all(name in stage_rows for name in PREREQUISITE):
                         continue
 
-                    ordered_alert_ids = []
-                    for name in PREREQUISITE:
-                        ordered_alert_ids.append(stage_rows[name]["id"])
+                    ordered_alert_ids = [stage_rows[name]["id"] for name in PREREQUISITE]
                     if "ddos" in stage_rows:
                         ordered_alert_ids.append(stage_rows["ddos"]["id"])
 
-                    start_timestamp = self.normalize_timestamp(stage_rows["port_scan"]["timestamp"])
+                    start_timestamp = self.normalize_timestamp(
+                        stage_rows["port_scan"]["timestamp"]
+                    )
                     last_updated = self.now_iso()
-                    mitre_sequence = " -> ".join(ATTACK_TO_MITRE[a] for a in PREREQUISITE)
+                    mitre_sequence = " -> ".join(
+                        ATTACK_TO_MITRE[attack] for attack in PREREQUISITE
+                    )
                     if "ddos" in stage_rows:
                         mitre_sequence += " -> " + ATTACK_TO_MITRE["ddos"]
 
-                    chain_id = "chain-" + hashlib.sha1(f"{source_ip}|{start_timestamp}|{'|'.join(str(v) for v in ordered_alert_ids)}".encode("utf-8")).hexdigest()[:12]
-                    new_payload = {
-                        "chain_id": chain_id,
-                        "alert_ids": ordered_alert_ids,
-                        "mitre_sequence": mitre_sequence,
-                        "start_time": start_timestamp,
-                        "last_updated": last_updated,
-                        "status": "active",
-                    }
+                    identity = (
+                        f"{stage_rows['port_scan']['source_ip']}|{campaign_id or ''}|"
+                        f"{stage_rows['port_scan']['id']}"
+                    )
+                    chain_id = "chain-" + hashlib.sha1(
+                        identity.encode("utf-8")
+                    ).hexdigest()[:12]
 
                     existing = conn.execute(
-                        "SELECT alert_ids, mitre_sequence, start_time, last_updated FROM attack_chains WHERE chain_id = ?",
+                        """
+                        SELECT chain_id, alert_ids, mitre_sequence, start_time
+                        FROM attack_chains WHERE chain_id = ?
+                        """,
                         (chain_id,),
                     ).fetchone()
 
+                    if not existing:
+                        # Reuse a chain created by the previous ID scheme so new
+                        # evidence updates it instead of leaving a stale duplicate.
+                        for candidate in conn.execute(
+                            """
+                            SELECT chain_id, alert_ids, mitre_sequence, start_time
+                            FROM attack_chains
+                            """
+                        ).fetchall():
+                            try:
+                                old_ids = json.loads(candidate["alert_ids"])
+                            except (TypeError, json.JSONDecodeError):
+                                continue
+                            if old_ids and old_ids[0] == stage_rows["port_scan"]["id"]:
+                                existing = candidate
+                                chain_id = candidate["chain_id"]
+                                break
+
                     changed = True
                     if existing:
-                        old_ids = json.loads(existing["alert_ids"])
-                        old_sequence = existing["mitre_sequence"]
-                        old_start = existing["start_time"]
-                        if old_ids == ordered_alert_ids and old_sequence == mitre_sequence and old_start == start_timestamp:
-                            changed = False
+                        try:
+                            old_ids = json.loads(existing["alert_ids"])
+                        except (TypeError, json.JSONDecodeError):
+                            old_ids = []
+                        changed = not (
+                            old_ids == ordered_alert_ids
+                            and existing["mitre_sequence"] == mitre_sequence
+                            and existing["start_time"] == start_timestamp
+                        )
 
                     if existing and changed:
                         conn.execute(
                             """
                             UPDATE attack_chains
-                            SET alert_ids = ?,
-                                mitre_sequence = ?,
-                                start_time = ?,
-                                last_updated = ?,
-                                status = 'active'
+                            SET alert_ids = ?, mitre_sequence = ?, start_time = ?,
+                                last_updated = ?, status = 'active'
                             WHERE chain_id = ?
                             """,
-                            (json.dumps(ordered_alert_ids), mitre_sequence, start_timestamp, last_updated, chain_id),
+                            (
+                                json.dumps(ordered_alert_ids),
+                                mitre_sequence,
+                                start_timestamp,
+                                last_updated,
+                                chain_id,
+                            ),
                         )
-                        logger.info("Meaningfully updated chain %s with %s alerts", chain_id, len(ordered_alert_ids))
+                        logger.info(
+                            "Meaningfully updated chain %s with %s alerts",
+                            chain_id,
+                            len(ordered_alert_ids),
+                        )
                     elif not existing:
                         conn.execute(
                             """
-                            INSERT OR IGNORE INTO attack_chains
+                            INSERT INTO attack_chains
                             (chain_id, alert_ids, mitre_sequence, start_time, last_updated, status)
                             VALUES (?, ?, ?, ?, ?, 'active')
                             """,
-                            (chain_id, json.dumps(ordered_alert_ids), mitre_sequence, start_timestamp, last_updated),
+                            (
+                                chain_id,
+                                json.dumps(ordered_alert_ids),
+                                mitre_sequence,
+                                start_timestamp,
+                                last_updated,
+                            ),
                         )
-                        logger.info("Created chain %s with %s alerts", chain_id, len(ordered_alert_ids))
+                        logger.info(
+                            "Created chain %s with %s alerts",
+                            chain_id,
+                            len(ordered_alert_ids),
+                        )
                     else:
                         logger.info("Duplicate chain skipped for %s", chain_id)
 
                     if not existing or changed:
                         conn.commit()
+                        payload = {
+                            "chain_id": chain_id,
+                            "alert_ids": ordered_alert_ids,
+                            "mitre_sequence": mitre_sequence,
+                            "start_time": start_timestamp,
+                            "last_updated": last_updated,
+                            "status": "active",
+                        }
                         try:
-                            self.bus.publish(EventBus.CHAIN_DETECTED, new_payload)
-                            logger.info("Published %s for %s", EventBus.CHAIN_DETECTED, chain_id)
-                        except Exception as exc:
-                            logger.warning("CHAIN_DETECTED publish failed for %s: %s", chain_id, exc)
+                            self.bus.publish(EventBus.CHAIN_DETECTED, payload)
+                            logger.info(
+                                "Published %s for %s",
+                                EventBus.CHAIN_DETECTED,
+                                chain_id,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "CHAIN_DETECTED publish failed for %s",
+                                chain_id,
+                            )
 
                     created_or_updated += 1 if not existing or changed else 0
                     consumed_ids.update(ordered_alert_ids)
 
-            logger.info("Correlation pass complete; created_or_updated %s chain records", created_or_updated)
-        except Exception as exc:
+            conn.commit()
+            logger.info(
+                "Correlation pass complete; created_or_updated %s chain records",
+                created_or_updated,
+            )
+        except Exception:
             conn.rollback()
-            logger.exception("Correlation engine failed: %s", exc)
+            logger.exception("Correlation engine failed")
         finally:
             conn.close()
 
@@ -345,6 +437,7 @@ class AnalysisAgent:
         """Score every active chain deterministically, deduplicating repeated evidence."""
         conn = self.connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             chains = conn.execute(
                 """
                 SELECT id, chain_id, alert_ids, start_time, last_updated
@@ -357,8 +450,18 @@ class AnalysisAgent:
             for chain in chains:
                 try:
                     alert_ids = json.loads(chain["alert_ids"])
-                except Exception:
-                    alert_ids = []
+                    if not isinstance(alert_ids, list) or any(
+                        isinstance(alert_id, bool) or not isinstance(alert_id, int)
+                        for alert_id in alert_ids
+                    ):
+                        raise ValueError("alert_ids must be a JSON array of integer IDs")
+                    alert_ids = list(dict.fromkeys(alert_ids))
+                except (TypeError, json.JSONDecodeError, ValueError):
+                    logger.warning(
+                        "Skipping chain %s with malformed alert_ids",
+                        chain["chain_id"],
+                    )
+                    continue
                 if not alert_ids:
                     continue
 
@@ -367,9 +470,11 @@ class AnalysisAgent:
                     SELECT id, timestamp, attack_type, source_ip, target_ip, target_node
                     FROM alerts
                     WHERE id IN ({placeholders})
-                    ORDER BY timestamp ASC
                 """
-                rows = conn.execute(sql, tuple(alert_ids)).fetchall()
+                fetched_rows = conn.execute(sql, tuple(alert_ids)).fetchall()
+                rows_by_id = {row["id"]: dict(row) for row in fetched_rows}
+                alert_ids = [alert_id for alert_id in alert_ids if alert_id in rows_by_id]
+                rows = [rows_by_id[alert_id] for alert_id in alert_ids if alert_id in rows_by_id]
                 if not rows:
                     continue
 
@@ -378,7 +483,7 @@ class AnalysisAgent:
                 for row in rows:
                     attack_type = row["attack_type"]
                     if attack_type in ("port_scan", "brute_force", "lateral_movement", "ddos") and attack_type not in seen_attack_types:
-                        selected.append(dict(row))
+                        selected.append(row)
                         seen_attack_types.add(attack_type)
 
                 if not selected:
@@ -440,6 +545,9 @@ class AnalysisAgent:
                     "score": score,
                     "severity_label": severity,
                     "timestamp": timestamp,
+                    "alert_ids": alert_ids,
+                    "evidence_count": len(alert_ids),
+                    "factors": factors,
                 }
                 try:
                     self.bus.publish(EventBus.SCORE_COMPUTED, payload)
@@ -450,8 +558,11 @@ class AnalysisAgent:
                         score,
                         severity,
                     )
-                except Exception as exc:
-                    logger.warning("SCORE_COMPUTED publish failed for %s: %s", chain["chain_id"], exc)
+                except Exception:
+                    logger.exception(
+                        "SCORE_COMPUTED publish failed for %s",
+                        chain["chain_id"],
+                    )
 
             logger.info("Scorer pass complete")
         except Exception as exc:
@@ -462,107 +573,184 @@ class AnalysisAgent:
 
     def insert_alert_from_event(self, payload):
         """Handle a NEW_ALERT Redis payload without depending on Person A being online."""
+        if not isinstance(payload, dict):
+            logger.warning("Malformed NEW_ALERT payload received: %s", payload)
+            return
+
         try:
-            if not isinstance(payload, dict):
-                logger.warning("Malformed NEW_ALERT payload received: %s", payload)
-                return
-
-            event_ts = payload.get("timestamp") or self.now_iso()
-            event_dtt = self.normalize_timestamp(event_ts)
-            source_ip = payload.get("source_ip") or "unknown"
-            target_ip = payload.get("target_ip") or "unknown"
-            target_node = payload.get("target_node") or "unknown"
+            event_dtt = self.normalize_timestamp(payload.get("timestamp"))
+            source_ip = payload.get("source_ip")
+            target_ip = payload.get("target_ip")
+            target_node = payload.get("target_node")
             attack_type = payload.get("attack_type")
-            if attack_type not in ATTACK_TO_MITRE:
-                logger.warning("Ignoring unsupported attack_type from NEW_ALERT event: %s", attack_type)
+            detection_source = payload.get("detection_source")
+
+            if not isinstance(source_ip, str) or not source_ip.strip():
+                raise ValueError("source_ip is required")
+            if not isinstance(target_ip, str) or not target_ip.strip():
+                raise ValueError("target_ip is required")
+            if not isinstance(attack_type, str) or attack_type.strip().lower() not in ATTACK_TO_MITRE:
+                raise ValueError(f"unsupported attack_type: {attack_type!r}")
+            if not isinstance(detection_source, str) or not detection_source.strip():
+                raise ValueError("detection_source is required")
+            if target_node is not None and not isinstance(target_node, str):
+                raise ValueError("target_node must be a string or null")
+
+            source_ip = source_ip.strip()
+            target_ip = target_ip.strip()
+            if target_node is not None:
+                target_node = target_node.strip() or None
+            attack_type = attack_type.strip().lower()
+            detection_source = detection_source.strip()
+            event_time = self.parse_ts(event_dtt)
+            raw_details = json.dumps(payload, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Malformed NEW_ALERT payload ignored: %s", exc)
+            return
+
+        seen_key = (
+            f"{event_dtt}|{source_ip}|{target_ip}|{target_node or ''}|"
+            f"{attack_type}|{detection_source}"
+        )
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            candidates = conn.execute(
+                """
+                SELECT timestamp FROM alerts
+                WHERE source_ip = ? AND target_ip = ? AND target_node IS ? AND attack_type = ?
+                """,
+                (source_ip, target_ip, target_node, attack_type),
+            ).fetchall()
+            if any(self.parse_ts(row["timestamp"]) == event_time for row in candidates):
+                logger.info("Duplicate alert row already exists for event: %s", seen_key)
                 return
 
-            detection_source = payload.get("detection_source") or "both"
-            raw_details = json.dumps(payload, sort_keys=True)
+            conn.execute(
+                """
+                INSERT INTO alerts
+                (timestamp, source_ip, target_ip, target_node, attack_type, detection_source, mitre_tactic, raw_details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_dtt,
+                    source_ip,
+                    target_ip,
+                    target_node,
+                    attack_type,
+                    detection_source,
+                    ATTACK_TO_MITRE[attack_type],
+                    raw_details,
+                ),
+            )
+            conn.commit()
+            logger.info("Inserted alert from NEW_ALERT event: %s", seen_key)
+        except Exception:
+            conn.rollback()
+            logger.exception("NEW_ALERT insertion failed")
+            return
+        finally:
+            conn.close()
 
-            seen_key = f"{event_dtt}|{source_ip}|{target_ip}|{target_node}|{attack_type}|{detection_source}".lower()
-            if seen_key in self.alert_seen_keys:
-                logger.debug("Duplicate NEW_ALERT ignored: %s", seen_key)
-                return
-            self.alert_seen_keys.add(seen_key)
-
-            conn = self.connect()
-            try:
-                existing = conn.execute(
-                    """
-                    SELECT id FROM alerts
-                    WHERE timestamp = ? AND source_ip = ? AND target_ip = ? AND target_node = ? AND attack_type = ?
-                    LIMIT 1
-                    """,
-                    (event_dtt, source_ip, target_ip, target_node, attack_type),
-                ).fetchone()
-                if existing:
-                    logger.info("Duplicate alert row already exists for event: %s", seen_key)
-                    return
-
-                conn.execute(
-                    """
-                    INSERT INTO alerts
-                    (timestamp, source_ip, target_ip, target_node, attack_type, detection_source, mitre_tactic, raw_details)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (event_dtt, source_ip, target_ip, target_node, attack_type, detection_source, ATTACK_TO_MITRE[attack_type], raw_details),
-                )
-                conn.commit()
-                logger.info("Inserted alert from NEW_ALERT event: %s", seen_key)
-                self.map_mitre_tactics()
-                self.correlate_chains()
-                self.score_chains()
-            except Exception as exc:
-                conn.rollback()
-                logger.exception("NEW_ALERT insertion failed: %s", exc)
-            finally:
-                conn.close()
-        except Exception as exc:
-            logger.exception("NEW_ALERT handler failed: %s", exc)
+        self.map_mitre_tactics()
+        self.correlate_chains()
+        self.score_chains()
 
     def insert_ml_prediction_from_event(self, payload):
         """Safely store an ML_PREDICTION event if it is well-formed for the shared schema in shared/schema.sql."""
+        if not isinstance(payload, dict):
+            logger.warning("Malformed ML_PREDICTION payload ignored: %s", payload)
+            return
+
         try:
-            if not isinstance(payload, dict):
-                logger.warning("Malformed ML_PREDICTION payload ignored: %s", payload)
+            timestamp = self.normalize_timestamp(payload.get("timestamp"))
+            target_node = payload.get("target_node")
+            predicted_class = payload.get("predicted_class")
+            confidence_value = payload.get("confidence")
+            if target_node is not None and not isinstance(target_node, str):
+                raise ValueError("target_node must be a string or null")
+            if not isinstance(predicted_class, str) or not predicted_class.strip():
+                raise ValueError("predicted_class is required")
+            if isinstance(confidence_value, bool):
+                raise ValueError("confidence must be a number between 0 and 1")
+            confidence = float(confidence_value)
+            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise ValueError("confidence must be a finite number between 0 and 1")
+
+            window_start = self.normalize_timestamp(
+                payload.get("window_start") or timestamp
+            )
+            window_end = self.normalize_timestamp(payload.get("window_end") or timestamp)
+            features = payload.get("features_json", {})
+            features_json = json.dumps(features, sort_keys=True, allow_nan=False)
+            if target_node is not None:
+                target_node = target_node.strip() or None
+            predicted_class = predicted_class.strip()
+        except (TypeError, ValueError) as exc:
+            logger.warning("Malformed ML_PREDICTION payload ignored: %s", exc)
+            return
+
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT id FROM ml_predictions
+                WHERE timestamp = ? AND window_start = ? AND window_end = ?
+                  AND target_node IS ? AND predicted_class = ? AND confidence = ?
+                  AND features_json = ?
+                LIMIT 1
+                """,
+                (
+                    timestamp,
+                    window_start,
+                    window_end,
+                    target_node,
+                    predicted_class,
+                    confidence,
+                    features_json,
+                ),
+            ).fetchone()
+            if existing:
+                logger.info(
+                    "Duplicate ML_PREDICTION ignored for %s",
+                    target_node or "unknown node",
+                )
                 return
 
-            timestamp = payload.get("timestamp") or self.now_iso()
-            timestamp = self.normalize_timestamp(timestamp)
-            target_node = payload.get("target_node") or None
-            predicted_class = payload.get("predicted_class") or "unknown"
-            confidence = float(payload.get("confidence") or 0.0)
-            window_start = payload.get("window_start") or timestamp
-            window_end = payload.get("window_end") or timestamp
-            features_json = json.dumps(payload.get("features_json") or payload, sort_keys=True)
-
-            conn = self.connect()
-            try:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO ml_predictions
-                    (timestamp, window_start, window_end, target_node, predicted_class, confidence, features_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (timestamp, window_start, window_end, target_node, predicted_class, confidence, features_json),
-                )
-                conn.commit()
-                logger.info("Processed ML_PREDICTION event for %s", target_node or "unknown node")
-            except Exception as exc:
-                conn.rollback()
-                logger.exception("ML_PREDICTION insertion failed: %s", exc)
-            finally:
-                conn.close()
-        except Exception as exc:
-            logger.exception("ML_PREDICTION handler failed: %s", exc)
+            conn.execute(
+                """
+                INSERT INTO ml_predictions
+                (timestamp, window_start, window_end, target_node, predicted_class, confidence, features_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    window_start,
+                    window_end,
+                    target_node,
+                    predicted_class,
+                    confidence,
+                    features_json,
+                ),
+            )
+            conn.commit()
+            logger.info(
+                "Processed ML_PREDICTION event for %s",
+                target_node or "unknown node",
+            )
+        except Exception:
+            conn.rollback()
+            logger.exception("ML_PREDICTION insertion failed")
+        finally:
+            conn.close()
 
     def start_event_listener(self):
         """Subscribe to both NEW_ALERT and ML_PREDICTION while allowing fixture/database mode to remain independent of Person A."""
         def worker():
             while True:
                 try:
-                    pubsub = self.bus.subscribe([EventBus.NEW_ALERT, EventBus.ML_PREDICTION])
+                    self.bus.subscribe([EventBus.NEW_ALERT, EventBus.ML_PREDICTION])
                     for channel, payload in self.bus.listen():
                         if channel == EventBus.NEW_ALERT:
                             logger.info("Received NEW_ALERT payload: %s", json.dumps(payload, sort_keys=True))
