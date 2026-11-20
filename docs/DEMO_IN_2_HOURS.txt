@@ -1,0 +1,99 @@
+================================================================================
+EDGESHIELD — 2-HOUR COUNTDOWN TO DEMO (use with FINAL_RUN_AND_DEMO.txt)
+================================================================================
+Project root = folder with docker-compose.yml (MajorProject-main on disk).
+
+THE ONE DECISION BEFORE YOU GO LIVE
+-----------------------------------
+  [A] DEFAULT VIVA (recommended): simulated defender — real attacks + real alerts
+      Command:  docker compose up
+      Say: policy and audit are real; enforcement is simulated unless we enable live lab mode.
+
+  [B] LIVE BLOCKING PROOF (only if panel insists):
+      docker compose -f docker-compose.yml -f docker-compose.final-demo.yml up --build
+      Proof: docker exec lab-traffic-source ping -c 2 172.28.0.11
+
+Pick A unless evaluators explicitly ask for firewall proof.
+
+
+================================================================================
+TIMELINE (120 minutes)
+================================================================================
+
+T-120  Copy project to demo laptop (whole MajorProject-main folder). Start Docker Desktop.
+       docker version && docker compose version
+
+T-110  cd <project-root>
+       copy .env.example .env        (Windows)
+       Optional clean volume only if old broken DB:
+       docker compose down -v
+
+T-100  docker compose build
+       Fix any build error before continuing (internet, disk space).
+
+T-85   docker compose up -d
+       docker compose ps    (all services should be Up)
+
+T-80   Open http://localhost:3000 and http://localhost:8000/health
+
+T-70   Wait for campaign: lab-traffic-source sleeps 45s then attacks.
+       docker logs -f lab-traffic-source   (separate terminal)
+
+T-55   Refresh dashboard — expect sensor_live alerts on multiple target_node values.
+
+T-45   Rehearse panel script (section 9 in FINAL_RUN_AND_DEMO.txt):
+       Fleet → benign telemetry → logs → alerts → chain → scores → responses → metrics
+
+T-20   Quick DB sanity (copy from FINAL_RUN_AND_DEMO.txt section 10).
+
+T-5    Close extra terminals; keep lab-traffic-source log ready if asked.
+
+T-0    DEMO — lead with heterogeneous Docker edge fleet + live lab traffic.
+
+
+================================================================================
+VERIFICATION PDF — BLOCKERS (all addressed on main)
+================================================================================
+
+Live pipeline (attacker → sensor → analysis → defender → dashboard)
+  FIXED — open correlator, Redis reconnect, enforcer + compose socket mount
+
+Defender Optional NameError
+  FIXED — person-c-defender/src/defender_agent.py imports Optional
+
+iptables in wrong namespace
+  FIXED — enforcer.py targets lab-traffic-source OUTPUT / nat
+
+Person B 3-stage-only / four attack types
+  FIXED — source-IP campaigns, 10+ types, DEFAULT_MITRE, synthetic excluded
+
+Static single-victim demo
+  FIXED — run_device_aware_campaign(), shared/edge_devices.py, DeviceFleet UI
+
+Honest simulation vs live enforcement
+  DEFAULT simulation in compose; final-demo overlay for live lab mode
+
+E2E proof in CI here
+  YOU RUN — Docker was not up on the authoring machine; your laptop validates.
+
+
+================================================================================
+IF SOMETHING FAILS IN THE LAST 30 MINUTES (priority order)
+================================================================================
+
+1. Docker not running → start Docker Desktop, retry up
+2. No alerts → wait 3 min; docker logs sensor-agent-1; REDIS_IP=172.28.0.30 set in compose
+3. No chains → docker logs analysis-agent; alerts must be sensor_live
+4. No responses → wait for >=2 alerts on chain; docker logs defender-agent
+5. Dashboard empty → curl http://localhost:8000/alerts ; rebuild frontend if code changed:
+   docker compose build dashboard-frontend && docker compose up -d dashboard-frontend
+
+Full troubleshooting: FINAL_RUN_AND_DEMO.txt section 13.
+
+================================================================================
+CANONICAL RUNBOOK (full commands + demo script)
+================================================================================
+  docs/FINAL_RUN_AND_DEMO.txt
+  docs/FINAL_PHASE_DEMO.md          (short panel narrative)
+
+================================================================================

@@ -2,8 +2,10 @@
 defender_agent.py  -  Person C  (EdgeShield) — dynamic response phase
 
 Subscribes to SCORE_COMPUTED (Person B). Resolves attacker/victim IPs and dominant
-attack_type from SQLite, applies proportional iptables tiers, honeypot DNAT on
-isolation, false-positive guard, adaptive rollback, and parallel chain handling.
+attack_type from SQLite, applies proportional iptables tiers in the attacker
+container (docker exec + OUTPUT/DNAT rules), honeypot DNAT on isolation,
+false-positive guard, adaptive rollback, per-victim responses on multi-node chains,
+and parallel chain handling.
 
 Threads:
   1  EventBus listener (SCORE_COMPUTED)
@@ -16,14 +18,14 @@ Each thread uses its own Redis EventBus connection.
 import json
 import logging
 import os
+import re
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Path setup for local Windows runs and Docker (/app)
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -36,15 +38,43 @@ for _p in (
         sys.path.insert(0, _p)
 
 from shared.eventbus_client import EventBus
+from shared import sqlite_util
+
+try:
+    from enforcer import (
+        format_steps,
+        get_container_stats,
+        parse_steps,
+        run_steps,
+        socket_available,
+    )
+except ImportError:
+    from src.enforcer import (
+        format_steps,
+        get_container_stats,
+        parse_steps,
+        run_steps,
+        socket_available,
+    )
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "/data/edgeshield.db")
 HONEYPOT_IP = os.environ.get("HONEYPOT_IP", "172.28.0.200")
-ATTACKER_CONTAINER = os.environ.get("ATTACKER_CONTAINER", "attacker")
-DEFENDER_ENFORCEMENT = os.environ.get("DEFENDER_ENFORCEMENT", "simulation").strip().lower()
+ATTACKER_CONTAINER = os.environ.get("ATTACKER_CONTAINER", "lab-traffic-source")
+_RAW_ENFORCEMENT = os.environ.get("DEFENDER_ENFORCEMENT", "auto").strip().lower()
+
+
+def _resolve_enforcement_mode() -> str:
+    if _RAW_ENFORCEMENT == "auto":
+        return "live" if socket_available() else "simulation"
+    return _RAW_ENFORCEMENT
+
+
+ENFORCEMENT_MODE = _resolve_enforcement_mode()
 
 ROLLBACK_POLL_SEC = 30
+TELEMETRY_POLL_SEC = 20
 FALLBACK_POLL_SEC = 15
 ROLLBACK_DELAY_SEC = 60
 MAX_ROLLBACK_DELAY_SEC = 300
@@ -76,11 +106,14 @@ OFF_HOURS_DELTA = 3.0
 HIGH_LOAD_CPU_DELTA = 5.0
 HIGH_LOAD_CPU_THRESHOLD = 80.0
 
-DEFAULT_DEVICES = (
-    ("172.28.0.11", "edge-node-1", "high"),
-    ("172.28.0.12", "edge-node-2", "medium"),
-    ("172.28.0.13", "edge-node-3", "critical"),
-)
+try:
+    from shared.edge_devices import EDGE_DEVICES
+except ImportError:
+    EDGE_DEVICES = {
+        "172.28.0.11": {"node_name": "edge-node-1", "criticality": "high", "device_class": "industrial_opc_gateway", "display_name": "Industrial OPC-UA Gateway", "description": "PLC gateway"},
+        "172.28.0.12": {"node_name": "edge-node-2", "criticality": "medium", "device_class": "iot_sensor_hub", "display_name": "IoT Sensor Hub", "description": "IoT hub"},
+        "172.28.0.13": {"node_name": "edge-node-3", "criticality": "critical", "device_class": "dns_utility_edge", "display_name": "DNS Utility Edge", "description": "DNS edge"},
+    }
 
 logging.basicConfig(
     level=logging.INFO,
@@ -112,45 +145,69 @@ def get_tier(score: float) -> dict:
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(SQLITE_PATH, timeout=10, check_same_thread=False)
-    c.row_factory = sqlite3.Row
+    return sqlite_util.connect(SQLITE_PATH, check_same_thread=False)
+
+
+EnforceStep = Tuple[str, str]
+
+
+def _node_name_for_ip(ip: str) -> Optional[str]:
     try:
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA busy_timeout=10000")
-    except sqlite3.Error:
+        conn = _conn()
+        row = conn.execute(
+            "SELECT device_name FROM device_registry WHERE ip_address = ?",
+            (ip,),
+        ).fetchone()
+        conn.close()
+        if row and row["device_name"]:
+            return str(row["device_name"])
+    except sqlite3.OperationalError:
         pass
-    return c
+    except Exception as exc:
+        log.debug("[registry] device_name lookup failed for %s: %s", ip, exc)
+    return None
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _enable_ip_forward():
-    try:
-        subprocess.run(
-            ["sysctl", "-w", "net.ipv4.ip_forward=1"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except Exception as exc:
-        log.debug("[net] ip_forward not set: %s", exc)
-
-
 def _seed_device_registry():
     try:
         conn = _conn()
-        for ip, name, crit in DEFAULT_DEVICES:
+        for ip, meta in EDGE_DEVICES.items():
+            name = meta["node_name"]
+            crit = meta["criticality"]
             conn.execute(
                 """INSERT OR IGNORE INTO device_registry
-                   (ip_address, device_name, criticality, registered_at)
-                   VALUES (?, ?, ?, ?)""",
-                (ip, name, crit, _now()),
+                   (ip_address, device_name, criticality, registered_at,
+                    device_class, display_name, description)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ip,
+                    name,
+                    crit,
+                    _now(),
+                    meta.get("device_class"),
+                    meta.get("display_name"),
+                    meta.get("description"),
+                ),
+            )
+            conn.execute(
+                """UPDATE device_registry
+                   SET criticality=?, device_class=?, display_name=?, description=?
+                   WHERE ip_address=?""",
+                (crit, meta.get("device_class"), meta.get("display_name"), meta.get("description"), ip),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO node_health
+                   (node_name, status, cpu_usage, memory_usage, last_updated)
+                   VALUES (?, 'healthy', 0.0, 0.0, ?)""",
+                (name, _now()),
             )
         conn.commit()
         conn.close()
-        log.info("[startup] device_registry seeded (%d devices)", len(DEFAULT_DEVICES))
+        log.info("[startup] device_registry seeded (%d heterogeneous devices)", len(EDGE_DEVICES))
     except sqlite3.OperationalError:
         log.warning("[startup] device_registry table missing — extensions not applied?")
     except Exception as exc:
@@ -191,30 +248,34 @@ def _node_cpu_load(victim_ip: str) -> float:
     return 0.0
 
 
-def _policy_score_for_victim(raw_score: float, victim_ip: str) -> float:
-    if victim_ip == "unknown":
+def _policy_score(chain_id: str, raw_score: float) -> float:
+    """Dynamic threshold: device criticality, off-hours, and node load."""
+    victims = _get_chain_victims(chain_id)
+    if not victims:
         return raw_score
-    delta = CRITICALITY_SCORE_DELTA.get(_device_criticality(victim_ip), 0.0)
+
+    crit_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+    dst = max(
+        victims.keys(),
+        key=lambda ip: crit_order.get(_device_criticality(ip), 1),
+    )
+
+    delta = CRITICALITY_SCORE_DELTA.get(_device_criticality(dst), 0.0)
     hour = datetime.now(timezone.utc).hour
     if hour >= 22 or hour < 6:
         delta += OFF_HOURS_DELTA
-    if _node_cpu_load(victim_ip) >= HIGH_LOAD_CPU_THRESHOLD:
+    if _node_cpu_load(dst) >= HIGH_LOAD_CPU_THRESHOLD:
         delta += HIGH_LOAD_CPU_DELTA
-    return min(100.0, max(0.0, raw_score + delta))
 
-
-def _policy_score(chain_id: str, raw_score: float) -> float:
-    """Dynamic threshold: worst-case adjustment across all victims on the chain."""
-    _, victims, _ = _get_chain_victims(chain_id)
-    if not victims:
-        return raw_score
-    adjusted = max(_policy_score_for_victim(raw_score, vip) for vip, _ in victims)
+    adjusted = min(100.0, max(0.0, raw_score + delta))
     if abs(adjusted - raw_score) >= 0.01:
         log.info(
-            "[policy] chain=%s score %.1f -> %.1f (multi-victim policy)",
+            "[policy] chain=%s score %.1f -> %.1f (delta=%+.1f victim=%s)",
             chain_id,
             raw_score,
             adjusted,
+            delta,
+            dst,
         )
     return adjusted
 
@@ -225,33 +286,9 @@ def _dominant_attack_type(types: list) -> str:
     return max(types, key=lambda t: ATTACK_SEVERITY.get(t, DEFAULT_SEVERITY))
 
 
-def _victim_node_name(victim_ip: str, target_node: Optional[str] = None) -> str:
-    if target_node:
-        return target_node
-    try:
-        conn = _conn()
-        row = conn.execute(
-            "SELECT device_name FROM device_registry WHERE ip_address = ?",
-            (victim_ip,),
-        ).fetchone()
-        conn.close()
-        if row and row["device_name"]:
-            return str(row["device_name"])
-    except Exception:
-        pass
-    return victim_ip
-
-
-def _get_chain_context(chain_id: str) -> Tuple[str, str, str]:
-    """Returns (source_ip attacker, primary target_ip victim, dominant attack_type)."""
-    src, victims, attack_type = _get_chain_victims(chain_id)
-    if not victims:
-        return "unknown", "unknown", attack_type
-    return src, victims[0][0], attack_type
-
-
-def _get_chain_victims(chain_id: str) -> Tuple[str, List[Tuple[str, str]], str]:
-    """Returns (attacker_ip, [(victim_ip, target_node), ...], dominant attack_type)."""
+def _get_chain_victims(chain_id: str) -> Dict[str, str]:
+    """Map victim IP -> dominant attack_type for alerts on that target."""
+    victims: Dict[str, List[str]] = {}
     try:
         conn = _conn()
         chain = conn.execute(
@@ -260,35 +297,66 @@ def _get_chain_victims(chain_id: str) -> Tuple[str, List[Tuple[str, str]], str]:
         ).fetchone()
         if not chain:
             conn.close()
-            return "unknown", [], "unknown"
+            return {}
         alert_ids = json.loads(chain["alert_ids"])
         if not alert_ids:
             conn.close()
-            return "unknown", [], "unknown"
+            return {}
         placeholders = ",".join("?" * len(alert_ids))
         rows = conn.execute(
-            f"""SELECT source_ip, target_ip, target_node, attack_type FROM alerts
+            f"""SELECT source_ip, target_ip, attack_type FROM alerts
+                WHERE id IN ({placeholders})""",
+            [int(i) for i in alert_ids],
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            dst = row["target_ip"]
+            if not dst:
+                continue
+            victims.setdefault(dst, [])
+            if row["attack_type"]:
+                victims[dst].append(row["attack_type"])
+        return {ip: _dominant_attack_type(types) for ip, types in victims.items()}
+    except Exception as exc:
+        log.warning("Could not derive victims for %s: %s", chain_id, exc)
+        return {}
+
+
+def _get_chain_context(chain_id: str) -> Tuple[str, str, str]:
+    """Returns (source_ip attacker, primary target_ip, dominant attack_type overall)."""
+    try:
+        conn = _conn()
+        chain = conn.execute(
+            "SELECT alert_ids FROM attack_chains WHERE chain_id = ?",
+            (chain_id,),
+        ).fetchone()
+        if not chain:
+            conn.close()
+            return "unknown", "unknown", "unknown"
+        alert_ids = json.loads(chain["alert_ids"])
+        if not alert_ids:
+            conn.close()
+            return "unknown", "unknown", "unknown"
+        placeholders = ",".join("?" * len(alert_ids))
+        rows = conn.execute(
+            f"""SELECT source_ip, target_ip, attack_type FROM alerts
                 WHERE id IN ({placeholders})""",
             [int(i) for i in alert_ids],
         ).fetchall()
         conn.close()
         if not rows:
-            return "unknown", [], "unknown"
-        src = rows[0]["source_ip"] or "unknown"
+            return "unknown", "unknown", "unknown"
+        src_ips = {r["source_ip"] for r in rows if r["source_ip"]}
+        src = next(iter(src_ips)) if len(src_ips) == 1 else (rows[0]["source_ip"] or "unknown")
+        victims = _get_chain_victims(chain_id)
+        if not victims:
+            return src, "unknown", "unknown"
+        dst = next(iter(victims.keys()))
         types = [r["attack_type"] for r in rows if r["attack_type"]]
-        seen: set = set()
-        victims: List[Tuple[str, str]] = []
-        for row in rows:
-            vip = row["target_ip"] or "unknown"
-            if vip == "unknown" or vip in seen:
-                continue
-            seen.add(vip)
-            node = row["target_node"] or _victim_node_name(vip)
-            victims.append((vip, node))
-        return src, victims, _dominant_attack_type(types)
+        return src, dst, _dominant_attack_type(types)
     except Exception as exc:
         log.warning("Could not derive chain context for %s: %s", chain_id, exc)
-        return "unknown", [], "unknown"
+        return "unknown", "unknown", "unknown"
 
 
 def _is_corroborated(chain_id: str) -> bool:
@@ -345,171 +413,123 @@ def _is_corroborated(chain_id: str) -> bool:
         return False
 
 
-def _rate_limit_cmd(attack_type: str, src: str) -> Tuple[str, str]:
-    base_drop = f"iptables -A INPUT -s {src} -j DROP"
+def _ns() -> str:
+    return ATTACKER_CONTAINER
+
+
+def _rate_limit_steps(attack_type: str, dst: str) -> Tuple[List[EnforceStep], List[EnforceStep]]:
+    ns = _ns()
+    drop = f"iptables -A OUTPUT -d {dst} -j DROP"
     if attack_type == "brute_force":
         accept = (
-            f"iptables -I INPUT -s {src} -p tcp --dport 22 "
+            f"iptables -I OUTPUT -d {dst} -p tcp --dport 22 "
             f"-m limit --limit 6/min --limit-burst 3 -j ACCEPT"
         )
-        rollback = (
-            f"iptables -D INPUT -s {src} -p tcp --dport 22 "
-            f"-m limit --limit 6/min --limit-burst 3 -j ACCEPT ; "
-            f"iptables -D INPUT -s {src} -j DROP"
-        )
-        return f"{accept} && {base_drop}", rollback
+        return [(ns, accept), (ns, drop)], [
+            (ns, f"iptables -D OUTPUT -d {dst} -j DROP"),
+            (ns, f"iptables -D OUTPUT -d {dst} -p tcp --dport 22 -m limit --limit 6/min --limit-burst 3 -j ACCEPT"),
+        ]
     if attack_type in ("ddos", "http_flood", "icmp_flood"):
-        accept = (
-            f"iptables -I INPUT -s {src} -m limit --limit 30/sec --limit-burst 50 -j ACCEPT"
-        )
-        rollback = (
-            f"iptables -D INPUT -s {src} -m limit --limit 30/sec --limit-burst 50 -j ACCEPT ; "
-            f"iptables -D INPUT -s {src} -j DROP"
-        )
-        return f"{accept} && {base_drop}", rollback
+        accept = f"iptables -I OUTPUT -d {dst} -m limit --limit 30/sec --limit-burst 50 -j ACCEPT"
+        return [(ns, accept), (ns, drop)], [
+            (ns, f"iptables -D OUTPUT -d {dst} -j DROP"),
+            (ns, f"iptables -D OUTPUT -d {dst} -m limit --limit 30/sec --limit-burst 50 -j ACCEPT"),
+        ]
     if attack_type == "port_scan":
         accept = (
-            f"iptables -I INPUT -s {src} -p tcp --tcp-flags SYN,RST,ACK,FIN SYN "
+            f"iptables -I OUTPUT -d {dst} -p tcp --tcp-flags SYN,RST,ACK,FIN SYN "
             f"-m limit --limit 15/min --limit-burst 10 -j ACCEPT"
         )
-        rollback = (
-            f"iptables -D INPUT -s {src} -p tcp --tcp-flags SYN,RST,ACK,FIN SYN "
-            f"-m limit --limit 15/min --limit-burst 10 -j ACCEPT ; "
-            f"iptables -D INPUT -s {src} -j DROP"
-        )
-        return f"{accept} && {base_drop}", rollback
-    accept = (
-        f"iptables -I INPUT -s {src} -m limit --limit 10/min --limit-burst 5 -j ACCEPT"
-    )
-    rollback = (
-        f"iptables -D INPUT -s {src} -m limit --limit 10/min --limit-burst 5 -j ACCEPT ; "
-        f"iptables -D INPUT -s {src} -j DROP"
-    )
-    return f"{accept} && {base_drop}", rollback
+        return [(ns, accept), (ns, drop)], [
+            (ns, f"iptables -D OUTPUT -d {dst} -j DROP"),
+            (ns, f"iptables -D OUTPUT -d {dst} -p tcp --tcp-flags SYN,RST,ACK,FIN SYN -m limit --limit 15/min --limit-burst 10 -j ACCEPT"),
+        ]
+    accept = f"iptables -I OUTPUT -d {dst} -m limit --limit 10/min --limit-burst 5 -j ACCEPT"
+    return [(ns, accept), (ns, drop)], [
+        (ns, f"iptables -D OUTPUT -d {dst} -j DROP"),
+        (ns, f"iptables -D OUTPUT -d {dst} -m limit --limit 10/min --limit-burst 5 -j ACCEPT"),
+    ]
 
 
-def _block_ip_cmd(attack_type: str, src: str) -> Tuple[str, str]:
+def _block_ip_steps(attack_type: str, dst: str) -> Tuple[List[EnforceStep], List[EnforceStep]]:
+    ns = _ns()
     if attack_type in ("ddos", "icmp_flood"):
-        cmd = f"iptables -I INPUT -s {src} -p icmp -j DROP"
-        rb = f"iptables -D INPUT -s {src} -p icmp -j DROP"
+        cmd = f"iptables -I OUTPUT -d {dst} -p icmp -j DROP"
     elif attack_type in ("brute_force", "credential_stuff"):
-        cmd = f"iptables -I INPUT -s {src} -p tcp --dport 22 -j DROP"
-        rb = f"iptables -D INPUT -s {src} -p tcp --dport 22 -j DROP"
+        cmd = f"iptables -I OUTPUT -d {dst} -p tcp --dport 22 -j DROP"
     elif attack_type == "http_flood":
-        cmd = f"iptables -I INPUT -s {src} -p tcp --dport 80 -j DROP"
-        rb = f"iptables -D INPUT -s {src} -p tcp --dport 80 -j DROP"
+        cmd = f"iptables -I OUTPUT -d {dst} -p tcp --dport 80 -j DROP"
     elif attack_type == "dns_tunnelling":
-        cmd = f"iptables -I INPUT -s {src} -p udp --dport 53 -j DROP"
-        rb = f"iptables -D INPUT -s {src} -p udp --dport 53 -j DROP"
+        cmd = f"iptables -I OUTPUT -d {dst} -p udp --dport 53 -j DROP"
     else:
-        cmd = f"iptables -I INPUT -s {src} -j DROP"
-        rb = f"iptables -D INPUT -s {src} -j DROP"
-    return cmd, rb
+        cmd = f"iptables -I OUTPUT -d {dst} -j DROP"
+    rb = cmd.replace("-I", "-D", 1)
+    return [(ns, cmd)], [(ns, rb)]
 
 
-def _isolate_cmd(src: str, dst: str) -> Tuple[str, str]:
-    apply_cmds = (
-        f"iptables -t nat -I PREROUTING -s {src} -d {dst} "
-        f"-j DNAT --to-destination {HONEYPOT_IP} && "
-        f"iptables -I FORWARD -s {src} -d {dst} -j DROP"
-    )
-    rollback = (
-        f"iptables -t nat -D PREROUTING -s {src} -d {dst} "
-        f"-j DNAT --to-destination {HONEYPOT_IP} ; "
-        f"iptables -D FORWARD -s {src} -d {dst} -j DROP"
-    )
-    return apply_cmds, rollback
+def _isolate_steps(dst: str) -> Tuple[List[EnforceStep], List[EnforceStep]]:
+    ns = _ns()
+    apply_cmd = f"iptables -t nat -A OUTPUT -d {dst} -j DNAT --to-destination {HONEYPOT_IP}"
+    rb = f"iptables -t nat -D OUTPUT -d {dst} -j DNAT --to-destination {HONEYPOT_IP}"
+    return [(ns, apply_cmd)], [(ns, rb)]
 
 
-def _full_isolation_cmd(src: str, dst: str) -> Tuple[str, str]:
-    apply_cmds = (
-        f"iptables -I INPUT -s {src} -j DROP && "
-        f"iptables -I FORWARD -d {dst} -j DROP"
-    )
-    rollback = (
-        f"iptables -D INPUT -s {src} -j DROP ; "
-        f"iptables -D FORWARD -d {dst} -j DROP"
-    )
-    return apply_cmds, rollback
+def _full_isolation_steps(dst: str) -> Tuple[List[EnforceStep], List[EnforceStep]]:
+    ns = _ns()
+    cmd = f"iptables -I OUTPUT -d {dst} -j DROP"
+    return [(ns, cmd)], [(ns, cmd.replace("-I", "-D", 1))]
 
 
-def _commands_for_tier(
+def _steps_for_tier(
     action_type: str, attack_type: str, src: str, dst: str
-) -> Tuple[Optional[str], Optional[str]]:
+) -> Tuple[List[EnforceStep], List[EnforceStep]]:
+    del src
     if action_type == "monitor":
-        return None, None
+        return [], []
     if action_type == "rate_limit":
-        return _rate_limit_cmd(attack_type, src)
+        return _rate_limit_steps(attack_type, dst)
     if action_type == "block_ip":
-        return _block_ip_cmd(attack_type, src)
+        return _block_ip_steps(attack_type, dst)
     if action_type == "isolate_node":
-        return _isolate_cmd(src, dst)
+        return _isolate_steps(dst)
     if action_type == "full_isolation":
-        return _full_isolation_cmd(src, dst)
-    return None, None
+        return _full_isolation_steps(dst)
+    return [], []
 
 
-def _live_iptables_cmd(cmd: str) -> str:
-    """Apply rules in the lab attacker namespace (OUTPUT toward victims), not defender INPUT."""
-    parts = []
-    for segment in cmd.split(" ; "):
-        segment = segment.strip()
-        if not segment:
-            continue
-        segment = (
-            segment.replace("iptables -A INPUT", "iptables -A OUTPUT")
-            .replace("iptables -I INPUT", "iptables -I OUTPUT")
-            .replace("iptables -D INPUT", "iptables -D OUTPUT")
-            .replace("-s ", "-d ", 1)
-            if " INPUT " in f" {segment} " or segment.startswith("iptables -")
-            and "INPUT" in segment
-            else segment
-        )
-        if "PREROUTING" in segment:
-            segment = segment.replace("PREROUTING", "OUTPUT")
-        if "FORWARD" in segment:
-            segment = segment.replace("FORWARD", "OUTPUT")
-        parts.append(segment)
-    inner = " ; ".join(parts)
-    escaped = inner.replace("'", "'\"'\"'")
-    return f"docker exec {ATTACKER_CONTAINER} sh -c '{escaped}'"
+def _enforce_steps(apply_steps: List[EnforceStep]) -> bool:
+    if ENFORCEMENT_MODE == "live":
+        ok = run_steps(apply_steps)
+        if ok:
+            log.info("[policy] LIVE enforcement applied (%d steps)", len(apply_steps))
+        return ok
+    log.info(
+        "[policy] SIMULATED enforcement (%d steps) — set DEFENDER_ENFORCEMENT=live for iptables",
+        len(apply_steps),
+    )
+    return True
 
 
-def _run_shell(cmd: str) -> bool:
-    if not cmd:
+def _live_rollback(rollback_cmd: Optional[str], label: str) -> bool:
+    if not rollback_cmd:
         return True
-    if DEFENDER_ENFORCEMENT == "simulation":
-        log.info("[iptables] SIMULATED: %s", cmd)
-        return True
-    run_cmd = _live_iptables_cmd(cmd) if DEFENDER_ENFORCEMENT == "live" else cmd
-    log.info("[iptables] RUN (%s): %s", DEFENDER_ENFORCEMENT, run_cmd)
-    try:
-        result = subprocess.run(
-            run_cmd, shell=True, capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            log.warning(
-                "[iptables] exit=%d stderr=%s",
-                result.returncode,
-                (result.stderr or "").strip(),
-            )
-            return DEFENDER_ENFORCEMENT != "live"
-        return True
-    except subprocess.TimeoutExpired:
-        log.error("[iptables] TIMEOUT: %s", run_cmd)
-        return False
-    except Exception as exc:
-        log.error("[iptables] ERROR: %s - %s", run_cmd, exc)
-        return False
+    if ENFORCEMENT_MODE == "live":
+        return run_steps(parse_steps(rollback_cmd))
+    log.info("[rollback] SIMULATED %s", label)
+    return True
 
 
-def _write_response(chain_id, action_type, target, rollback_cmd) -> int:
+def _write_response(
+    chain_id, action_type, target, rollback_cmd, policy_reason: str = ""
+) -> int:
+    mode = "live" if ENFORCEMENT_MODE == "live" else "simulated"
     conn = _conn()
     cur = conn.execute(
         """INSERT INTO responses
-           (chain_id, timestamp, action_type, target, rollback_command, status)
-           VALUES (?, ?, ?, ?, ?, 'active')""",
-        (chain_id, _now(), action_type, target, rollback_cmd),
+           (chain_id, timestamp, action_type, target, rollback_command, status,
+            enforcement_mode, policy_reason)
+           VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+        (chain_id, _now(), action_type, target, rollback_cmd, mode, policy_reason),
     )
     rowid = cur.lastrowid
     conn.commit()
@@ -539,6 +559,20 @@ def _get_active_response(chain_id: str):
     return row
 
 
+def _rollback_active_for_chain(chain_id: str):
+    """Remove prior tier rules before escalating to a new tier on the same chain."""
+    conn = _conn()
+    rows = conn.execute(
+        """SELECT id, rollback_command FROM responses
+             WHERE chain_id=? AND status='active'""",
+        (chain_id,),
+    ).fetchall()
+    conn.close()
+    for row in rows:
+        _live_rollback(row["rollback_command"], f"pre-escalation id={row['id']}")
+        _mark_rolled_back(row["id"])
+
+
 def _get_latest_score(chain_id: str):
     conn = _conn()
     row = conn.execute(
@@ -549,12 +583,17 @@ def _get_latest_score(chain_id: str):
     return float(row["score"]) if row else None
 
 
-def _update_node_health(node_name: str, status: str):
+def _update_node_health(victim_ip: str, status: str):
+    """Update node_health using device_registry name (never attacker IP)."""
+    node_name = _node_name_for_ip(victim_ip)
+    if not node_name:
+        log.debug("[node_health] skip unregistered IP %s", victim_ip)
+        return
     try:
         conn = _conn()
         conn.execute(
-            """INSERT INTO node_health (node_name, status, last_updated)
-               VALUES (?, ?, ?)
+            """INSERT INTO node_health (node_name, status, cpu_usage, memory_usage, last_updated)
+               VALUES (?, ?, 0.0, 0.0, ?)
                ON CONFLICT(node_name) DO UPDATE
                SET status=excluded.status,
                    last_updated=excluded.last_updated""",
@@ -566,12 +605,118 @@ def _update_node_health(node_name: str, status: str):
         log.warning("[node_health] update failed: %s", exc)
 
 
-def _node_name_from_target(target: str) -> str:
-    if not target or target == "unknown":
-        return target
-    if target.count(".") == 3 and target.replace(".", "").isdigit():
-        return _victim_node_name(target)
-    return target
+def _cpu_percent_from_stats(stats: dict) -> float:
+    try:
+        cpu_stats = stats.get("cpu_stats") or {}
+        precpu = stats.get("precpu_stats") or {}
+        usage_delta = (
+            cpu_stats.get("cpu_usage", {}).get("total_usage", 0)
+            - precpu.get("cpu_usage", {}).get("total_usage", 0)
+        )
+        system_delta = (
+            cpu_stats.get("system_cpu_usage", 0) - precpu.get("system_cpu_usage", 0)
+        )
+        if system_delta <= 0:
+            return 0.0
+        online = cpu_stats.get("online_cpus") or 1
+        return min(100.0, (usage_delta / system_delta) * online * 100.0)
+    except Exception:
+        return 0.0
+
+
+def _memory_percent_from_stats(stats: dict) -> float:
+    try:
+        mem = stats.get("memory_stats") or {}
+        usage = float(mem.get("usage", 0))
+        limit = float(mem.get("limit") or 1)
+        return min(100.0, (usage / limit) * 100.0)
+    except Exception:
+        return 0.0
+
+
+def _publish_edge_telemetry():
+    """Poll Docker stats for edge-node containers → node_health (Person C)."""
+    if not socket_available():
+        return
+    try:
+        conn = _conn()
+        for meta in EDGE_DEVICES.values():
+            node_name = meta["node_name"]
+            stats = get_container_stats(node_name)
+            if not stats:
+                continue
+            cpu = _cpu_percent_from_stats(stats)
+            mem = _memory_percent_from_stats(stats)
+            row = conn.execute(
+                "SELECT status FROM node_health WHERE node_name=?",
+                (node_name,),
+            ).fetchone()
+            status = row["status"] if row else "healthy"
+            conn.execute(
+                """INSERT INTO node_health (node_name, status, cpu_usage, memory_usage, last_updated)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(node_name) DO UPDATE SET
+                       cpu_usage=excluded.cpu_usage,
+                       memory_usage=excluded.memory_usage,
+                       last_updated=excluded.last_updated""",
+                (node_name, status, cpu, mem, _now()),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        log.debug("[telemetry] edge stats update failed: %s", exc)
+
+
+def _finalize_rollback(
+    resp: dict,
+    bus: EventBus,
+    reason: str,
+    latest_score: Optional[float] = None,
+):
+    chain_id = resp["chain_id"]
+    response_id = resp["id"]
+    action_type = resp["action_type"]
+    target = resp["target"]
+    rollback_cmd = resp["rollback_command"]
+
+    _live_rollback(rollback_cmd, f"rollback id={response_id} reason={reason}")
+    _mark_rolled_back(response_id)
+    _log_optional_rollback_history(chain_id, response_id, reason)
+    victim_ip = _victim_ip_from_rollback(rollback_cmd)
+    if victim_ip:
+        _update_node_health(victim_ip, "healthy")
+    elif action_type in ("isolate_node", "full_isolation") and target:
+        _update_node_health(target, "healthy")
+    now = datetime.now(timezone.utc)
+    with _state_lock:
+        active_left = False
+        try:
+            conn = _conn()
+            left = conn.execute(
+                "SELECT COUNT(*) AS c FROM responses WHERE chain_id=? AND status='active'",
+                (chain_id,),
+            ).fetchone()
+            conn.close()
+            active_left = bool(left and left["c"] > 0)
+        except Exception:
+            active_left = False
+        if not active_left:
+            _active_tier_map.pop(chain_id, None)
+            _below_since.pop(chain_id, None)
+            _last_rollback_at[chain_id] = now
+    bus.publish(
+        EventBus.RESPONSE_EXECUTED,
+        {
+            "response_id": response_id,
+            "chain_id": chain_id,
+            "action_type": "rollback",
+            "target": target,
+            "score": latest_score,
+            "severity": f"rollback - {reason}",
+            "enforcement_mode": "live" if ENFORCEMENT_MODE == "live" else "simulated",
+            "timestamp": _now(),
+        },
+    )
 
 
 def _log_optional_honeypot(chain_id: str, src: str):
@@ -609,6 +754,17 @@ def _log_optional_rollback_history(chain_id: str, response_id: int, reason: str)
 def _rollback_delay_for(chain_id: str) -> float:
     with _state_lock:
         return _rollback_delay_sec.get(chain_id, ROLLBACK_DELAY_SEC)
+
+
+def _victim_ip_from_rollback(rollback_cmd: Optional[str]) -> Optional[str]:
+    if not rollback_cmd:
+        return None
+    for _ns, cmd in parse_steps(rollback_cmd):
+        match = re.search(r"-d\s+(\d{1,3}(?:\.\d{1,3}){3})", cmd)
+        if match:
+            return match.group(1)
+    match = re.search(r"-d\s+(\d{1,3}(?:\.\d{1,3}){3})", rollback_cmd)
+    return match.group(1) if match else None
 
 
 def _note_false_rollback(chain_id: str):
@@ -651,62 +807,79 @@ def _apply_response(chain_id: str, score: float, bus: EventBus):
         log.info("[policy] chain=%s already at tier=%s - skip", chain_id, tier["action_type"])
         return
 
-    src, victims, attack_type = _get_chain_victims(chain_id)
+    if current is not None and current != tier["action_type"]:
+        log.info(
+            "[policy] chain=%s escalating %s -> %s — rolling back prior rules",
+            chain_id,
+            current,
+            tier["action_type"],
+        )
+        _rollback_active_for_chain(chain_id)
+
+    victims = _get_chain_victims(chain_id)
+    src, _, _ = _get_chain_context(chain_id)
     if src == "unknown" or not victims:
         log.warning("[policy] cannot derive src/victims for chain=%s - skip", chain_id)
         return
 
-    # One enforcement action per distinct victim IP (Person B multi-victim chains).
     applied_any = False
-    for dst, node_name in victims:
-        command, rollback_cmd = _commands_for_tier(
+    for dst, attack_type in victims.items():
+        apply_steps, rollback_steps = _steps_for_tier(
             tier["action_type"], attack_type, src, dst
         )
         display_target = dst if tier["action_type"] in ("isolate_node", "full_isolation") else src
+        rollback_stored = format_steps(rollback_steps)
+        reason = f"score={score:.1f} tier={tier['action_type']} attack={attack_type}"
 
         response_id = _write_response(
-            chain_id, tier["action_type"], display_target, rollback_cmd
+            chain_id,
+            tier["action_type"],
+            display_target,
+            rollback_stored,
+            policy_reason=reason,
         )
-        success = _run_shell(command) if command else True
+        success = _enforce_steps(apply_steps) if apply_steps else True
 
-        if not success:
+        if success:
+            applied_any = True
+            log.info(
+                "[policy] APPLIED chain=%s score=%.1f tier=%s attack=%s src=%s dst=%s id=%d",
+                chain_id,
+                score,
+                tier["action_type"],
+                attack_type,
+                src,
+                dst,
+                response_id,
+            )
+            if tier["action_type"] == "isolate_node":
+                _log_optional_honeypot(chain_id, src)
+            _update_node_health(dst, tier["action_type"])
+            bus.publish(
+                EventBus.RESPONSE_EXECUTED,
+                {
+                    "response_id": response_id,
+                    "chain_id": chain_id,
+                    "action_type": tier["action_type"],
+                    "target": display_target,
+                    "victim_ip": dst,
+                    "source_ip": src,
+                    "attack_type": attack_type,
+                    "score": score,
+                    "severity": tier["label"],
+                    "enforcement_mode": (
+                        "live" if ENFORCEMENT_MODE == "live" else "simulated"
+                    ),
+                    "timestamp": _now(),
+                },
+            )
+        else:
             log.error(
-                "[policy] command FAILED chain=%s tier=%s victim=%s",
+                "[policy] command FAILED chain=%s tier=%s dst=%s",
                 chain_id,
                 tier["action_type"],
                 dst,
             )
-            continue
-
-        applied_any = True
-        log.info(
-            "[policy] APPLIED chain=%s score=%.1f tier=%s attack=%s src=%s dst=%s node=%s id=%d",
-            chain_id,
-            score,
-            tier["action_type"],
-            attack_type,
-            src,
-            dst,
-            node_name,
-            response_id,
-        )
-        if tier["action_type"] == "isolate_node":
-            _log_optional_honeypot(chain_id, src)
-        _update_node_health(node_name, tier["action_type"])
-        bus.publish(
-            EventBus.RESPONSE_EXECUTED,
-            {
-                "response_id": response_id,
-                "chain_id": chain_id,
-                "action_type": tier["action_type"],
-                "target": display_target,
-                "source_ip": src,
-                "attack_type": attack_type,
-                "score": score,
-                "severity": tier["label"],
-                "timestamp": _now(),
-            },
-        )
 
     if applied_any:
         with _state_lock:
@@ -735,13 +908,29 @@ def _rollback_thread(bus: EventBus):
     while True:
         try:
             conn = _conn()
+            resolved_active = conn.execute(
+                """SELECT r.id, r.chain_id, r.action_type, r.target, r.rollback_command
+                     FROM responses r
+                     JOIN attack_chains ac ON ac.chain_id = r.chain_id
+                    WHERE r.status='active' AND ac.status='resolved'"""
+            ).fetchall()
             active = conn.execute(
                 """SELECT id, chain_id, action_type, target, rollback_command
                      FROM responses WHERE status='active'"""
             ).fetchall()
             conn.close()
 
+            for resp in resolved_active:
+                log.info(
+                    "[thread-2] chain=%s resolved — rolling back response id=%s",
+                    resp["chain_id"],
+                    resp["id"],
+                )
+                _finalize_rollback(dict(resp), bus, "chain_resolved_attack_stopped")
+
             for resp in active:
+                if any(resp["id"] == r["id"] for r in resolved_active):
+                    continue
                 chain_id = resp["chain_id"]
                 response_id = resp["id"]
                 action_type = resp["action_type"]
@@ -780,28 +969,11 @@ def _rollback_thread(bus: EventBus):
                             action_type,
                             target,
                         )
-                        if rollback_cmd:
-                            _run_shell(rollback_cmd)
-                        _mark_rolled_back(response_id)
-                        _log_optional_rollback_history(
-                            chain_id, response_id, "score_below_tier"
-                        )
-                        _update_node_health(_node_name_from_target(target), "healthy")
-                        with _state_lock:
-                            _active_tier_map.pop(chain_id, None)
-                            _below_since.pop(chain_id, None)
-                            _last_rollback_at[chain_id] = now
-                        bus.publish(
-                            EventBus.RESPONSE_EXECUTED,
-                            {
-                                "response_id": response_id,
-                                "chain_id": chain_id,
-                                "action_type": "rollback",
-                                "target": target,
-                                "score": latest_score,
-                                "severity": "rollback - score dropped",
-                                "timestamp": _now(),
-                            },
+                        _finalize_rollback(
+                            dict(resp),
+                            bus,
+                            "score_below_tier",
+                            latest_score=latest_score,
                         )
                 else:
                     with _state_lock:
@@ -850,6 +1022,19 @@ def _fallback_thread(bus: EventBus):
         except Exception as exc:
             log.error("[thread-3] error: %s", exc)
         time.sleep(FALLBACK_POLL_SEC)
+
+
+def _telemetry_thread():
+    log.info(
+        "[thread-4] Edge telemetry started - interval=%ds (docker stats → node_health)",
+        TELEMETRY_POLL_SEC,
+    )
+    while True:
+        try:
+            _publish_edge_telemetry()
+        except Exception as exc:
+            log.error("[thread-4] error: %s", exc)
+        time.sleep(TELEMETRY_POLL_SEC)
 
 
 def _wait_for_redis() -> EventBus:
@@ -923,14 +1108,22 @@ def main():
     log.info("  REDIS_HOST   = %s:%s", REDIS_HOST, REDIS_PORT)
     log.info("  SQLITE_PATH  = %s", SQLITE_PATH)
     log.info("  HONEYPOT_IP  = %s", HONEYPOT_IP)
-    log.info("  ENFORCEMENT  = %s", DEFENDER_ENFORCEMENT)
-    log.info("  ATTACKER_NS  = %s", ATTACKER_CONTAINER)
     log.info("  WORKERS      = %d", EXECUTOR_WORKERS)
+    log.info("  ENFORCEMENT  = %s (requested=%s)", ENFORCEMENT_MODE, _RAW_ENFORCEMENT)
     log.info("=" * 55)
 
     _wait_for_sqlite()
     _init_schema()
-    _enable_ip_forward()
+    if socket_available():
+        log.info(
+            "[startup] Enforcing iptables in container %s via Docker socket / enforcer",
+            ATTACKER_CONTAINER,
+        )
+    else:
+        log.warning(
+            "[startup] Docker socket unavailable — rules will run in defender namespace only"
+        )
+    _publish_edge_telemetry()
     bus = _wait_for_redis()
 
     bus.subscribe([EventBus.SCORE_COMPUTED])
@@ -947,12 +1140,16 @@ def main():
     t3 = threading.Thread(
         target=_fallback_thread, args=(bus3,), daemon=True, name="polling-fallback"
     )
+    t4 = threading.Thread(
+        target=_telemetry_thread, daemon=True, name="edge-telemetry"
+    )
 
     t1.start()
     t2.start()
     t3.start()
+    t4.start()
 
-    log.info("[startup] All three threads running - Defender Agent is LIVE")
+    log.info("[startup] Defender threads running (listener, rollback, fallback, telemetry)")
 
     while True:
         time.sleep(60)

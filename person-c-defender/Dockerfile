@@ -7,6 +7,7 @@ RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sourc
     apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     iproute2 \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

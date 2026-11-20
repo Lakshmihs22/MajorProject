@@ -18,7 +18,11 @@ Person C sits after Person B’s threat scoring. It listens for `SCORE_COMPUTED`
 | **False-positive guard** | Needs ≥2 alerts on the chain and ≥5 seconds between first and last alert; DB errors → **no** response (fail-secure). |
 | **Parallel chains** | `ThreadPoolExecutor` with 20 workers so many chains are handled at once. |
 | **Adaptive rollback** | Default 60s below tier before rollback; delay **doubles** after a false rollback (max 300s). |
-| **Honeypot** | On `isolate_node`: DNAT attacker traffic toward victim to `HONEYPOT_IP` (default `172.28.0.200`) + FORWARD drop to real victim. |
+| **Honeypot** | On `isolate_node`: DNAT in the **attacker** network namespace — `OUTPUT -d <victim> → HONEYPOT_IP` (default `172.28.0.200`). |
+| **Live enforcement** | `DEFENDER_ENFORCEMENT=auto` (default): **live** iptables in `lab-traffic-source` when the Docker socket is mounted; `simulation` = audit only. Uses `docker exec` + rollback JSON steps. |
+| **Edge telemetry** | Thread 4 polls `docker stats` for `edge-node-*` → `node_health.cpu_usage` / `memory_usage`. |
+| **Rollback on attack end** | When Person B marks a chain `resolved`, active iptables rules roll back automatically. |
+| **Multi-victim chains** | One response row + firewall rules **per distinct victim IP** in the chain (not only the first alert). |
 | **Device registry** | Seeds edge nodes with criticality (`high` / `medium` / `critical`). |
 | **Dynamic policy score** | Adjusts Person B’s raw score using victim criticality, off-hours (UTC 22:00–06:00), and high CPU in `node_health` (+5 if CPU ≥ 80%). |
 | **Three background threads** | (1) Redis listener, (2) rollback checker every 30s, (3) DB polling fallback every 15s. Each thread has its **own** Redis connection. |
@@ -33,8 +37,8 @@ Person C sits after Person B’s threat scoring. It listens for `SCORE_COMPUTED`
 | 0–29 | `monitor` | Log only |
 | 30–49 | `rate_limit` | Attack-type-specific rate limit + drop |
 | 50–69 | `block_ip` | Drop / restrict traffic from attacker IP |
-| 70–84 | `isolate_node` | DNAT to honeypot + protect victim |
-| 85–100 | `full_isolation` | Drop from attacker + drop forward to victim |
+| 70–84 | `isolate_node` | DNAT attacker→victim traffic to honeypot |
+| 85–100 | `full_isolation` | `OUTPUT -d <victim> -j DROP` in attacker namespace |
 
 ### Supported attack types (extensible)
 
@@ -47,7 +51,8 @@ Person C sits after Person B’s threat scoring. It listens for `SCORE_COMPUTED`
 ```
 person-c-defender/
 ├── README.md                 ← this file
-├── Dockerfile                ← defender image (iptables, agent)
+├── docker-compose.defender-overlay.yml  ← mount Docker socket for live blocking
+├── Dockerfile                ← defender image (iptables, docker CLI, agent)
 ├── requirements.txt          ← redis
 ├── schema_extensions.sql     ← device_registry, honeypot_*, rollback_history
 ├── src/
@@ -84,9 +89,9 @@ Open a terminal in the **project root** (folder that contains `docker-compose.ym
 | `REDIS_PORT` | `6379` | Defender |
 | `SQLITE_PATH` | `/data/edgeshield.db` | Defender (in container) |
 | `HONEYPOT_IP` | `172.28.0.200` | Defender DNAT target |
+| `ATTACKER_CONTAINER` | `attacker` | Container name for `docker exec` enforcement |
+| `ENFORCE_IN_ATTACKER_NS` | `auto` | `auto` (socket present), `true`, or `false` |
 | `HONEYPOT_LOG` | `/data/honeypot_log.jsonl` | Honeypot container |
-| `DEFENDER_ENFORCEMENT` | `simulation` | `simulation` (DB + Redis only) or `live` (docker exec into attacker) |
-| `ATTACKER_CONTAINER` | `attacker` | Container name for live iptables (matches root `docker-compose.yml`) |
 
 Host-side demo script: set `REDIS_HOST=localhost` when Redis port `6379` is published.
 
@@ -100,14 +105,13 @@ Host-side demo script: set `REDIS_HOST=localhost` when Redis port `6379` is publ
 docker compose up --build redis honeypot defender-agent
 ```
 
-Wait for log line: `Defender Agent is LIVE`.
+For **live iptables** (blocks real attacker traffic), add the Person C overlay:
 
-**If your friend “cannot see the defender at all”:**
+```bash
+docker compose -f docker-compose.yml -f person-c-defender/docker-compose.defender-overlay.yml up --build redis honeypot attacker defender-agent
+```
 
-1. Confirm the container is running: `docker ps --filter name=defender-agent` (not exited/restarting).
-2. Check logs: `docker logs defender-agent` — a past bug used `Optional` without importing it and the process died immediately on startup; pull the latest `person-c-defender/src/defender_agent.py` if logs show `NameError: Optional`.
-3. The dashboard has no separate “Defender” tile — responses appear under **Response Audit Log** on http://localhost:3000 (needs `defender-agent` + `analysis-agent` or the seed script).
-4. Default enforcement is **simulation** (rows in SQLite + `RESPONSE_EXECUTED` on Redis); live blocking needs the overlay compose file below.
+Wait for log line: `Defender Agent is LIVE` and `Enforcing iptables in container attacker via Docker socket`.
 
 ### 2) Full EdgeShield stack (demo with dashboard)
 
@@ -253,8 +257,12 @@ python person-c-defender\src\defender_agent.py
 
 ### Honeypot / DNAT not visible in traffic
 
-- DNAT is applied in the **defender container’s network namespace**; full path visibility depends on bridge routing and who generates traffic. For the project demo, **DB responses + honeypot JSONL + dashboard** are the primary proof.
-- Defender is `privileged: true` with `NET_ADMIN` and enables `net.ipv4.ip_forward=1` at startup.
+- Rules run in the **attacker** container’s namespace via `docker exec` when the socket overlay is used. Without the overlay, rules only apply inside the defender container (fixture/demo DB path still works).
+- Attacker image already has `NET_ADMIN`; defender image ships the static `docker` CLI.
+
+### Defender crashes on import (`NameError: Optional`)
+
+- Fixed in current `defender_agent.py` (`from typing import Optional, Tuple`). Rebuild the image after pulling updates.
 
 ### Dashboard shows no responses
 
@@ -300,7 +308,7 @@ Person C **must** resolve IPs from SQLite; do not rely on `target_ip` in `SCORE_
 
 ## Is everything done?
 
-**Person C implementation:** yes — agent, honeypot service, schema extensions, compose wiring, and demo seed script are included in this zip.
+**Person C implementation:** agent, honeypot, schema extensions, docker-socket overlay, multi-victim enforcement, and demo seed script. Live blocking still needs Person B chain fixes for full attack→score→block in compose without fixtures.
 
 **Your checklist on the new laptop:**
 

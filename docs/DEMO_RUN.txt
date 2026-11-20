@@ -1,0 +1,295 @@
+================================================================================
+EDGESHIELD — HOW TO RUN & DEMO (final)
+================================================================================
+Put this file in:  <repo-root>/docs/DEMO_RUN.txt
+
+Repo root = folder that contains docker-compose.yml (e.g. MajorProject-main).
+Use the MAIN project tree only (not a separate person-b stub folder).
+
+================================================================================
+0. BEFORE YOU START
+================================================================================
+
+You need:
+  [ ] Docker Desktop running (Linux containers / WSL2 on Windows)
+  [ ] Free ports: 3000 (UI), 8000 (API), 6379 (Redis optional on host)
+  [ ] ~8 GB RAM free for Docker
+  [ ] This full repo folder copied or cloned onto the demo machine
+
+Check Docker:
+  docker version
+  docker compose version
+
+Optional static file check (no Docker):
+  Windows PowerShell, from repo root:
+    powershell -File scripts\preflight_file_check.ps1
+
+================================================================================
+1. ONE-TIME SETUP (REPO ROOT)
+================================================================================
+
+Windows:
+  cd "C:\path\to\MajorProject-main"
+  copy .env.example .env
+
+Linux / macOS:
+  cd /path/to/MajorProject-main
+  cp .env.example .env
+
+Fresh database (only if old data is broken):
+  docker compose down -v
+  WARNING: -v wipes the shared SQLite volume.
+
+================================================================================
+2. BUILD (FIRST TIME OR AFTER PULLING CODE)
+================================================================================
+
+From repo root, build everything:
+
+  docker compose build
+
+If Person C / defender / lab-traffic changed, rebuild at minimum:
+
+  docker compose build lab-traffic-source defender-agent
+  docker compose build
+
+First build can take 10–20 minutes (sensors + Suricata + frontend npm).
+
+================================================================================
+3. START THE FULL STACK (STANDARD FINAL DEMO)
+================================================================================
+
+Start all 13 services:
+
+  docker compose up
+
+Or detached:
+
+  docker compose up -d
+  docker compose logs -f
+
+Wait about 2–3 minutes after startup:
+  - Redis healthy
+  - health-probe begins benign curls (~25 s)
+  - lab-traffic-source sleeps 45 s, then multi-device attack campaign
+  - Sensors → Analysis → Defender → Dashboard pipeline
+
+Open in browser:
+  Dashboard:     http://localhost:3000
+  API health:    http://localhost:8000/health
+  Device fleet:  http://localhost:8000/devices
+  Node health:   http://localhost:8000/node-health
+
+================================================================================
+4. DEFENDER / FIREWALL MODE (PERSON C — WHAT DEFAULT DOES)
+================================================================================
+
+docker-compose.yml sets:
+  DEFENDER_ENFORCEMENT=auto
+
+Meaning:
+  - Docker socket is mounted on defender-agent → LIVE iptables in
+    lab-traffic-source namespace (real lab rules, not host PC firewall).
+  - No socket → simulated (audit only).
+
+See active mode in logs:
+  docker logs defender-agent 2>&1 | findstr /i ENFORCEMENT
+  (Linux/mac: use grep instead of findstr)
+
+You should see something like:  ENFORCEMENT = live (requested=auto)
+
+Prove rules in adversary container (after a high tier response):
+  docker exec lab-traffic-source iptables -L OUTPUT -n
+  docker exec lab-traffic-source iptables -t nat -L OUTPUT -n
+
+Force simulation only (safe pitch, no iptables):
+  In .env or compose:  DEFENDER_ENFORCEMENT=simulation
+  Then:  docker compose up -d defender-agent
+
+Force live explicitly:
+  DEFENDER_ENFORCEMENT=live
+  Or overlay:  docker compose -f docker-compose.yml -f docker-compose.final-demo.yml up -d
+
+Optional ping test while block/isolate active:
+  docker exec lab-traffic-source ping -c 2 172.28.0.11
+
+================================================================================
+5. LAB MAP (FOR PANEL)
+================================================================================
+
+IP / role                         Container(s)
+---------------------------------------------------------------------------
+172.28.0.9   Benign health probe    health-probe
+172.28.0.10  Lab adversary          lab-traffic-source
+172.28.0.11  Industrial OPC gateway edge-node-1 + sensor-agent-1
+172.28.0.12  IoT sensor hub         edge-node-2 + sensor-agent-2
+172.28.0.13  DNS utility edge       edge-node-3 + sensor-agent-3
+172.28.0.30  Redis                  redis
+172.28.0.31  Analysis               analysis-agent
+172.28.0.32  Defender               defender-agent
+172.28.0.40  API                    dashboard-backend
+172.28.0.41  UI                     dashboard-frontend
+172.28.0.200 Honeypot               honeypot
+
+One adversary IP → one correlated campaign across multiple edge targets.
+
+================================================================================
+6. DEMO SCRIPT (15–20 MINUTES)
+================================================================================
+
+STEP 1 — Dashboard
+  Open http://localhost:3000
+  Say: multi-agent edge defense in Docker.
+
+STEP 2 — Edge device fleet
+  Section: "Edge device fleet (Docker lab)"
+  Three device classes, three IPs, criticality (DNS edge = critical).
+
+STEP 3 — Benign traffic (not an attack)
+  "Packet telemetry (live observations)"
+  Source 172.28.0.9, kind benign_health_check.
+
+STEP 4 — Live attack (terminal)
+  docker logs -f lab-traffic-source
+  Narrate: recon all edges, per-device attacks, lateral pivot, impact.
+
+STEP 5 — Alerts
+  Security Alerts: provenance sensor_live, multiple target_node values.
+
+STEP 6 — Chains & MITRE
+  Chain graph: one chain_id, multiple victims.
+  Say: analysis maps tactics (Person B).
+
+STEP 7 — Threat scores
+  Scores rise; decay after idle / chain resolved.
+
+STEP 8 — Defender responses (Person C)
+  Response log: tiers (rate_limit, block_ip, isolate_node, …)
+  enforcement_mode: live (auto) or simulated
+  docker logs -f defender-agent
+  Mention: rollback when score drops or chain marked resolved.
+
+STEP 9 — Node health (Person C telemetry)
+  Node health panel: CPU & memory % (defender polls docker stats every ~20 s).
+  curl http://localhost:8000/node-health
+
+STEP 10 — Evaluation
+  Metrics vs ground_truth.jsonl (live alerts, not synthetic).
+
+STEP 11 — Synthetic button (optional, 30 s)
+  "Run labeled synthetic scenario" → yellow synthetic_scenario only.
+  Say: excluded from live correlation — not the main story.
+
+================================================================================
+7. QUICK VERIFICATION COMMANDS
+================================================================================
+
+All services up:
+  docker compose ps
+
+API smoke:
+  curl http://localhost:8000/health
+  curl http://localhost:8000/alerts?limit=10
+  curl http://localhost:8000/chains
+  curl http://localhost:8000/responses
+
+Database counts:
+  docker exec defender-agent python -c "import sqlite3;c=sqlite3.connect('/data/edgeshield.db');print('alerts',c.execute('select count(*) from alerts').fetchone()[0]);print('chains',c.execute('select count(*) from attack_chains').fetchone()[0]);print('responses',c.execute('select count(*) from responses').fetchone()[0])"
+
+Follow logs:
+  docker logs -f analysis-agent
+  docker logs -f defender-agent
+  docker logs -f sensor-agent-1
+
+================================================================================
+8. OPTIONAL — TRAIN ML MODEL (PERSON A)
+================================================================================
+
+After traffic generated training_data + ground_truth on shared volume:
+
+  docker compose exec sensor-agent-1 python src/train_model.py
+
+Restart sensors to load model.joblib:
+  docker compose restart sensor-agent-1 sensor-agent-2 sensor-agent-3
+
+Rule-based detection works without the model file.
+
+================================================================================
+9. STOP / RESET
+================================================================================
+
+Stop, keep data:
+  docker compose down
+
+Stop and wipe DB volume:
+  docker compose down -v
+
+After code change:
+  docker compose build
+  docker compose up -d
+
+================================================================================
+10. TROUBLESHOOTING
+================================================================================
+
+Docker cannot connect
+  → Start Docker Desktop; wait until healthy.
+
+No alerts
+  → Wait 2–3 min after lab-traffic-source starts.
+  → docker logs sensor-agent-1
+  → docker logs lab-traffic-source
+
+No chains
+  → Alerts must be sensor_live (not only synthetic).
+  → docker logs analysis-agent
+
+No defender responses
+  → FP guard needs ≥2 alerts on chain, ≥5 s apart; wait for campaign.
+  → docker logs defender-agent
+
+enforcement_mode always simulated
+  → Confirm socket mount on defender-agent in docker compose ps.
+  → Rebuild defender-agent; set DEFENDER_ENFORCEMENT=live if needed.
+  → Rebuild lab-traffic-source (iptables must exist in that image).
+
+Node health CPU/memory empty
+  → Wait 20–30 s; defender thread polls docker stats.
+  → docker logs defender-agent | findstr telemetry
+
+Dashboard empty
+  → curl http://localhost:8000/alerts
+  → docker compose restart dashboard-backend dashboard-frontend
+
+================================================================================
+11. CHEAT SHEET (COPY-PASTE)
+================================================================================
+
+  cd <repo-root>
+  copy .env.example .env
+  docker compose build
+  docker compose up -d
+  start http://localhost:3000
+  docker logs -f lab-traffic-source
+  docker logs -f defender-agent
+
+================================================================================
+12. WHAT TO SAY HONESTLY
+================================================================================
+
+  - Attacks and detection are REAL between Docker containers.
+  - Edge “devices” are containers with distinct roles/IPs/sensors.
+  - auto enforcement = live iptables inside lab-traffic-source only (not your PC).
+  - Use DEFENDER_ENFORCEMENT=simulation if you must not claim blocking.
+  - Synthetic dashboard button is a labeled test harness only.
+
+================================================================================
+RELATED DOCS
+================================================================================
+  docs/FINAL_PHASE_DEMO.md     — Short panel narrative
+  docs/FINAL_RUN_AND_DEMO.txt  — Extended runbook (older enforcement notes)
+  person-c-defender/README.md  — Person C detail
+
+================================================================================
+END — EdgeShield final demo run
+================================================================================

@@ -1,0 +1,211 @@
+================================================================================
+EDGESHIELD — FINAL RUN & DEMO GUIDE (extended)
+================================================================================
+
+>>> Canonical short run + demo: docs/DEMO_RUN.txt (use that for evaluation day)
+
+Short countdown: docs/DEMO_IN_2_HOURS.txt
+Blocker checklist: docs/FINAL_VERIFICATION_STATUS.md
+Project root: folder containing docker-compose.yml (e.g. MajorProject-main)
+
+Prerequisites on the laptop:
+  - Docker Desktop installed, running, Linux containers (WSL2 on Windows OK)
+  - Ports free: 3000 (dashboard UI), 8000 (API), 6379 (Redis on host, optional)
+  - Copy the whole project folder (or git clone) — use MAIN tree, not person-b stub branch
+
+================================================================================
+PART 0 — ONE-TIME SETUP
+================================================================================
+
+1. Open terminal at project root:
+   Windows PowerShell example:
+     cd "C:\path\to\MajorProject-main"
+
+2. Optional environment file:
+     copy .env.example .env
+   (Defaults in compose are usually enough.)
+
+3. Clean start (only if you had a broken old volume):
+     docker compose down -v
+   WARNING: -v deletes SQLite data on the shared volume.
+
+================================================================================
+PART 1 — BUILD AND RUN (DEFAULT DEMO — REAL TRAFFIC + SIMULATED DEFENSE)
+================================================================================
+
+1. Build all images:
+     docker compose build
+
+2. Start full stack:
+     docker compose up
+
+   Or detached (logs in background):
+     docker compose up -d
+     docker compose logs -f
+
+3. Wait ~2 minutes for:
+   - Redis healthy
+   - Sensors + Suricata on edge-node-1/2/3
+   - lab-traffic-source (45s delay then multi-device campaign)
+   - analysis-agent, defender-agent, dashboard
+
+4. Open in browser:
+   - Dashboard UI:  http://localhost:3000
+   - API health:    http://localhost:8000/health
+   - API metrics:   http://localhost:8000/metrics
+
+================================================================================
+PART 2 — DEFENDER ENFORCEMENT (PERSON C)
+================================================================================
+Default in compose: DEFENDER_ENFORCEMENT=auto
+  → live iptables in lab-traffic-source when Docker socket is mounted on defender.
+  → simulation if socket missing.
+
+Force simulation: set DEFENDER_ENFORCEMENT=simulation in .env
+Force live: DEFENDER_ENFORCEMENT=live or docker-compose.final-demo.yml overlay
+
+Prove enforcement (while a high tier is active):
+     docker exec lab-traffic-source ping -c 2 172.28.0.11
+
+================================================================================
+PART 3 — LAB TOPOLOGY (WHAT TO SAY TO PANEL)
+================================================================================
+
+Service / role                    Container name           IP
+---------------------------------------------------------------------------
+Benign health probe               health-probe             172.28.0.9
+Lab adversary (real attacks)        lab-traffic-source       172.28.0.10
+Industrial OPC-UA gateway         edge-node-1 + sensor-1   172.28.0.11
+IoT sensor hub                    edge-node-2 + sensor-2   172.28.0.12
+DNS / utility edge                edge-node-3 + sensor-3   172.28.0.13
+Redis                             redis                    172.28.0.30
+Analysis agent                    analysis-agent           172.28.0.31
+Defender                          defender-agent           172.28.0.32
+Dashboard API                     dashboard-backend        172.28.0.40
+Dashboard UI                      dashboard-frontend       172.28.0.41
+Honeypot                          honeypot                 172.28.0.200
+
+Each edge node = different device class; each has its own passive sensor (shared
+network namespace with that edge node).
+
+================================================================================
+PART 4 — DEMO SCRIPT (15–20 MINUTES)
+================================================================================
+
+Step 1 — Edge device fleet
+  Dashboard: "Edge device fleet (Docker lab)"
+  Expect: 3 rows — industrial gateway, IoT hub, DNS utility edge with IPs and criticality.
+
+Step 2 — Benign observation (NOT an attack)
+  Dashboard: "Packet telemetry (live observations)"
+  Expect: Rows from source 172.28.0.9, kind benign_health_check, node edge-node-1.
+  Say: "Connectivity probe only; not attack detection."
+
+Step 3 — Live attack narrative
+  Terminal:
+     docker logs -f lab-traffic-source
+  Expect: port scan all edges, brute/lateral, credential + HTTP on IoT hub, DNS on
+  DNS edge, ARP, DDoS impact.
+
+Step 4 — Live alerts
+  Dashboard: Security Alerts
+  Expect: provenance = sensor_live; multiple target_node values; attack types include
+  port_scan, brute_force, lateral_movement, credential_stuff, http_flood,
+  dns_tunnelling, arp_spoofing, ddos (subset visible per sensor placement).
+
+Step 5 — Campaign correlation
+  Dashboard: Attack chain graph / chains
+  Expect: ONE chain_id from single attacker IP spanning multiple victims/nodes.
+
+Step 6 — Scores and decay
+  Dashboard: Score chart
+  Expect: Scores rise with evidence; may decay after campaign idles (resolved chain).
+
+Step 7 — Defender policy
+  Dashboard: Response log
+  Expect: tier (rate_limit/block/isolate/etc.); enforcement_mode = simulated (default).
+  Logs:
+     docker logs -f defender-agent
+  Look for: "SIMULATED enforcement" unless using final-demo overlay.
+
+Step 8 — Node health
+  Dashboard: Node health — CPU telemetry from sensors.
+
+Step 9 — Evaluation metrics
+  Dashboard: Evaluation metrics
+  Expect: F1/precision/recall when ground_truth.jsonl matches live alerts.
+  Metrics exclude synthetic_scenario by design.
+
+Step 10 — Synthetic (OPTIONAL, 30 seconds)
+  Dashboard: "Synthetic scenario (labeled)" → Run button
+  Expect: Alerts with provenance synthetic_scenario (yellow label).
+  Say: "Fixture-style pipeline test only; excluded from live campaign correlation."
+  Do NOT present this as the main demo.
+
+================================================================================
+PART 5 — USEFUL COMMANDS (TROUBLESHOOTING)
+================================================================================
+
+Watch all service status:
+     docker compose ps
+
+Follow key logs:
+     docker logs -f sensor-agent-1
+     docker logs -f analysis-agent
+     docker logs -f defender-agent
+     docker logs -f dashboard-backend
+
+SQLite spot-check (from defender container):
+     docker exec defender-agent python -c "import sqlite3; c=sqlite3.connect('/data/edgeshield.db'); print('chains', c.execute('select chain_id,status from attack_chains').fetchall()); print('alerts', c.execute('select count(*) from alerts').fetchone())"
+
+API quick checks:
+     curl http://localhost:8000/health
+     curl http://localhost:8000/devices
+     curl http://localhost:8000/chains
+     curl http://localhost:8000/alerts?limit=20
+     curl http://localhost:8000/evaluation
+
+Train ML model (optional, after some traffic):
+     docker compose exec sensor-agent-1 python src/train_model.py
+  Model path: /data/model.joblib (shared volume, all sensors use MODEL_PATH).
+
+Restart one service after code change:
+     docker compose build defender-agent
+     docker compose up -d defender-agent
+
+Full stop:
+     docker compose down
+
+================================================================================
+PART 6 — PERSON C-ONLY SMOKE (NO FULL ATTACK STACK)
+================================================================================
+
+     docker compose up --build redis honeypot defender-agent dashboard-backend dashboard-frontend
+
+Seed demo (from host, Redis on localhost):
+  Windows:
+     set REDIS_HOST=localhost
+     set SQLITE_PATH=data\edgeshield.db
+     python person-c-defender\scripts\seed_person_c_demo.py
+
+================================================================================
+PART 7 — WHAT NOT TO CLAIM
+================================================================================
+
+  - Do not say synthetic scenario button = real attack.
+  - Do not say simulated enforcement = live blocking unless final-demo overlay + ping test.
+  - Do not say metrics from synthetic data = real-world accuracy.
+  - Physical OPC/IoT hardware is represented by Docker edge nodes (panel-approved approach).
+
+================================================================================
+PART 8 — RELATED DOCS IN REPO
+================================================================================
+
+  docs/FINAL_PHASE_DEMO.md          — Short panel narrative
+  docs/implementation-checklist-status.md — Checklist mapping
+  shared/edge_devices.py            — Device class definitions
+  docker-compose.final-demo.yml     — Live enforcement overlay
+
+================================================================================
+END
+================================================================================
