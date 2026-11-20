@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS responses (
     target TEXT NOT NULL,
     rollback_command TEXT,
     status TEXT DEFAULT 'active',    -- active, rolled_back
-    rolled_back_at TEXT
+    rolled_back_at TEXT,
+    enforcement_mode TEXT,           -- live or simulated (Person C)
+    policy_reason TEXT               -- score/tier context (Person C)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
