@@ -583,7 +583,7 @@ class AnalysisAgent:
             target_ip = payload.get("target_ip")
             target_node = payload.get("target_node")
             attack_type = payload.get("attack_type")
-            detection_source = payload.get("detection_source")
+            detection_source = payload.get("detection_source") or "unknown"
 
             if not isinstance(source_ip, str) or not source_ip.strip():
                 raise ValueError("source_ip is required")
@@ -591,8 +591,6 @@ class AnalysisAgent:
                 raise ValueError("target_ip is required")
             if not isinstance(attack_type, str) or attack_type.strip().lower() not in ATTACK_TO_MITRE:
                 raise ValueError(f"unsupported attack_type: {attack_type!r}")
-            if not isinstance(detection_source, str) or not detection_source.strip():
-                raise ValueError("detection_source is required")
             if target_node is not None and not isinstance(target_node, str):
                 raise ValueError("target_node must be a string or null")
 
