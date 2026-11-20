@@ -392,7 +392,11 @@ def _is_corroborated(chain_id: str) -> bool:
             last = datetime.fromisoformat(rows[-1]["timestamp"].replace("Z", "+00:00"))
             gap = (last - first).total_seconds()
         except Exception:
-            return True
+            log.warning(
+                "[fp_guard] chain %s: could not parse alert timestamps — treating as uncorroborated",
+                chain_id,
+            )
+            return False
         if gap < FP_MIN_GAP_SEC:
             log.info(
                 "[fp_guard] chain %s: span=%.1fs < %.1fs - burst",
@@ -569,8 +573,15 @@ def _rollback_active_for_chain(chain_id: str):
     ).fetchall()
     conn.close()
     for row in rows:
-        _live_rollback(row["rollback_command"], f"pre-escalation id={row['id']}")
-        _mark_rolled_back(row["id"])
+        ok = _live_rollback(row["rollback_command"], f"pre-escalation id={row['id']}")
+        if ok:
+            _mark_rolled_back(row["id"])
+        else:
+            log.error(
+                "[rollback] pre-escalation FAILED id=%s chain=%s — response stays active",
+                row["id"],
+                chain_id,
+            )
 
 
 def _get_latest_score(chain_id: str):
@@ -679,7 +690,15 @@ def _finalize_rollback(
     target = resp["target"]
     rollback_cmd = resp["rollback_command"]
 
-    _live_rollback(rollback_cmd, f"rollback id={response_id} reason={reason}")
+    ok = _live_rollback(rollback_cmd, f"rollback id={response_id} reason={reason}")
+    if not ok:
+        log.error(
+            "[rollback] apply FAILED id=%s chain=%s reason=%s — leaving status active",
+            response_id,
+            chain_id,
+            reason,
+        )
+        return
     _mark_rolled_back(response_id)
     _log_optional_rollback_history(chain_id, response_id, reason)
     victim_ip = _victim_ip_from_rollback(rollback_cmd)
@@ -1007,7 +1026,8 @@ def _fallback_thread(bus: EventBus):
 
             for row in rows:
                 chain_id = row["chain_id"]
-                score = _policy_score(chain_id, float(row["score"]))
+                raw_score = float(row["score"])
+                score = _policy_score(chain_id, raw_score)
                 existing = _get_active_response(chain_id)
                 if existing:
                     continue
@@ -1016,8 +1036,13 @@ def _fallback_thread(bus: EventBus):
                 tier = get_tier(score)
                 if current == tier["action_type"]:
                     continue
-                log.info("[thread-3] fallback triggered chain=%s score=%.1f", chain_id, score)
-                _executor.submit(_apply_response, chain_id, score, bus)
+                log.info(
+                    "[thread-3] fallback triggered chain=%s raw_score=%.1f policy_score=%.1f",
+                    chain_id,
+                    raw_score,
+                    score,
+                )
+                _executor.submit(_apply_response, chain_id, raw_score, bus)
 
         except Exception as exc:
             log.error("[thread-3] error: %s", exc)
@@ -1072,6 +1097,28 @@ def _wait_for_sqlite():
     sys.exit(1)
 
 
+def _migrate_sqlite_columns(conn: sqlite3.Connection):
+    """Idempotent ALTER TABLE for databases created before column additions."""
+    planned = [
+        ("device_registry", "device_class", "TEXT"),
+        ("device_registry", "display_name", "TEXT"),
+        ("device_registry", "description", "TEXT"),
+        ("responses", "enforcement_mode", "TEXT"),
+        ("responses", "policy_reason", "TEXT"),
+    ]
+    for table, column, col_type in planned:
+        try:
+            existing = {
+                r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+        except sqlite3.OperationalError:
+            continue
+        if column in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        log.info("[startup] migrated %s.%s", table, column)
+
+
 def _init_schema():
     scripts = []
     for path in (
@@ -1097,6 +1144,7 @@ def _init_schema():
         with open(path, encoding="utf-8") as f:
             conn.executescript(f.read())
         log.info("[startup] Schema applied: %s", path)
+    _migrate_sqlite_columns(conn)
     conn.commit()
     conn.close()
     _seed_device_registry()

@@ -20,7 +20,9 @@ def get_responses():
             target,
             rollback_command,
             status,
-            rolled_back_at
+            rolled_back_at,
+            enforcement_mode,
+            policy_reason
         FROM responses
         ORDER BY timestamp DESC
     """)

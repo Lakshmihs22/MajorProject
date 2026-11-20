@@ -122,6 +122,14 @@ function ResponseLog({ refreshKey }) {
                 </th>
 
                 <th style={headerStyle}>
+                  Enforcement
+                </th>
+
+                <th style={headerStyle}>
+                  Policy
+                </th>
+
+                <th style={headerStyle}>
                   Rollback
                 </th>
 
@@ -175,6 +183,23 @@ function ResponseLog({ refreshKey }) {
                         {response.status}
                       </span>
 
+                    </td>
+
+                    <td style={cellStyle}>
+                      {response.enforcement_mode || "-"}
+                    </td>
+
+                    <td
+                      style={{
+                        ...cellStyle,
+                        maxWidth: "220px",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap"
+                      }}
+                      title={response.policy_reason || ""}
+                    >
+                      {response.policy_reason || "-"}
                     </td>
 
                     <td style={cellStyle}>

@@ -5,6 +5,9 @@ CREATE TABLE IF NOT EXISTS device_registry (
     ip_address TEXT UNIQUE NOT NULL,
     device_name TEXT NOT NULL,
     criticality TEXT NOT NULL DEFAULT 'medium',
+    device_class TEXT,
+    display_name TEXT,
+    description TEXT,
     registered_at TEXT NOT NULL
 );
 

@@ -15,7 +15,7 @@ Person C sits after Person B’s threat scoring. It listens for `SCORE_COMPUTED`
 | **SQLite context lookup** | Person B does **not** send `target_ip` in the event. Defender reads `attack_chains` → `alerts` for `source_ip` (attacker), `target_ip` (victim), and dominant `attack_type`. |
 | **Five response tiers** | `monitor`, `rate_limit`, `block_ip`, `isolate_node`, `full_isolation` (score bands 0–29 … 85–100). |
 | **Attack-specific iptables** | Rules differ for e.g. `brute_force` (port 22), `ddos` / floods, `dns_tunnelling`, etc. Unknown types use `DEFAULT_SEVERITY=18` for type ranking. |
-| **False-positive guard** | Needs ≥2 alerts on the chain and ≥5 seconds between first and last alert; DB errors → **no** response (fail-secure). |
+| **False-positive guard** | Needs ≥2 alerts on the chain and ≥5 seconds between first and last alert; DB errors or unparseable timestamps → **no** response (fail-secure). |
 | **Parallel chains** | `ThreadPoolExecutor` with 20 workers so many chains are handled at once. |
 | **Adaptive rollback** | Default 60s below tier before rollback; delay **doubles** after a false rollback (max 300s). |
 | **Honeypot** | On `isolate_node`: DNAT in the **attacker** network namespace — `OUTPUT -d <victim> → HONEYPOT_IP` (default `172.28.0.200`). |
@@ -25,7 +25,7 @@ Person C sits after Person B’s threat scoring. It listens for `SCORE_COMPUTED`
 | **Multi-victim chains** | One response row + firewall rules **per distinct victim IP** in the chain (not only the first alert). |
 | **Device registry** | Seeds edge nodes with criticality (`high` / `medium` / `critical`). |
 | **Dynamic policy score** | Adjusts Person B’s raw score using victim criticality, off-hours (UTC 22:00–06:00), and high CPU in `node_health` (+5 if CPU ≥ 80%). |
-| **Three background threads** | (1) Redis listener, (2) rollback checker every 30s, (3) DB polling fallback every 15s. Each thread has its **own** Redis connection. |
+| **Four background threads** | Redis listener, rollback checker, DB polling fallback, and Docker telemetry. Redis-consuming threads use their **own** connection. |
 | **DB extensions** | `device_registry`, `honeypot_sessions`, `rollback_history` (via `schema_extensions.sql` at startup). |
 | **Honeypot HTTP service** | Flask catch-all on port 80; logs to `/data/honeypot_log.jsonl` on the shared volume. |
 | **Docker Compose** | Root `docker-compose.yml` includes `honeypot` + `defender-agent` with `HONEYPOT_IP` and shared `edgeshield-data` volume. |
@@ -53,10 +53,11 @@ person-c-defender/
 ├── README.md                 ← this file
 ├── docker-compose.defender-overlay.yml  ← mount Docker socket for live blocking
 ├── Dockerfile                ← defender image (iptables, docker CLI, agent)
-├── requirements.txt          ← redis
+├── requirements.txt          ← redis, Docker SDK
 ├── schema_extensions.sql     ← device_registry, honeypot_*, rollback_history
 ├── src/
-│   └── defender_agent.py     ← main agent
+│   ├── defender_agent.py     ← main agent
+│   └── enforcer.py           ← lab-container enforcement and telemetry
 ├── honeypot/
 │   ├── Dockerfile
 │   └── honeypot_server.py
