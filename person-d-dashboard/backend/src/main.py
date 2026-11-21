@@ -377,7 +377,7 @@ async def websocket_endpoint(websocket: WebSocket):
             pubsub = redis_client.pubsub()
             pubsub.subscribe(
                 "NEW_ALERT", "ML_PREDICTION", "CHAIN_DETECTED",
-                "SCORE_COMPUTED", "RESPONSE_EXECUTED"
+                "SCORE_COMPUTED", "CHAIN_RESOLVED", "RESPONSE_EXECUTED"
             )
             redis_available = True
         except Exception as error:
