@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS attack_chains (
     mitre_sequence TEXT,             -- e.g. "TA0043 -> TA0006 -> TA0008"
     start_time TEXT NOT NULL,
     last_updated TEXT NOT NULL,
+    last_activity_at TEXT,
     status TEXT DEFAULT 'active'     -- active, resolved
 );
 

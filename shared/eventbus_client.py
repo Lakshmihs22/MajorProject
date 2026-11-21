@@ -11,6 +11,7 @@ Event types (keep these names identical across all four people's code):
     ML_PREDICTION    - fired by Person A's ML classifier
     CHAIN_DETECTED    - fired by Person B's Correlation Engine
     SCORE_COMPUTED   - fired by Person B's Threat Scorer
+    CHAIN_RESOLVED   - fired by Person B when a chain resolves through inactivity
     RESPONSE_EXECUTED - fired by Person C's Defender Agent
 """
 
@@ -23,6 +24,7 @@ class EventBus:
     ML_PREDICTION = "ML_PREDICTION"
     CHAIN_DETECTED = "CHAIN_DETECTED"
     SCORE_COMPUTED = "SCORE_COMPUTED"
+    CHAIN_RESOLVED = "CHAIN_RESOLVED"
     RESPONSE_EXECUTED = "RESPONSE_EXECUTED"
 
     def __init__(self, host="redis", port=6379):

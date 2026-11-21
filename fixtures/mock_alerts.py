@@ -9,9 +9,11 @@ local sqlite file for quick iteration:
     python fixtures/mock_alerts.py /path/to/edgeshield.db
 """
 
+import json
 import sqlite3
 import sys
 import random
+import uuid
 from datetime import datetime, timedelta
 
 ATTACK_TYPES = ["port_scan", "brute_force", "lateral_movement", "ddos"]
@@ -24,6 +26,7 @@ def main(db_path: str):
         conn.executescript(f.read())
 
     base_time = datetime.utcnow()
+    campaign_id = str(uuid.uuid4())
     rows = []
     t = base_time
     for i in range(50):
@@ -38,7 +41,13 @@ def main(db_path: str):
             attack_type,
             random.choice(["scapy", "suricata", "both"]),
             None,
-            f"mock alert #{i}",
+            json.dumps(
+                {
+                    "campaign_id": campaign_id,
+                    "is_synthetic": True,
+                },
+                sort_keys=True,
+            ),
         ))
 
     conn.executemany(
